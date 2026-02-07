@@ -99,15 +99,17 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
 5. COMMANDS                                            *gh-review-commands*
 
 :GHReview checkout [number]              *:GHReview-checkout*
-  Check out a PR branch and load review data. Prompts for number if omitted.
+  Check out a PR branch and load review data. If number is omitted, opens a
+  fuzzy picker showing open PRs searchable by title, author, and description.
+  Requires snacks.nvim for the picker.
 
 :GHReview files                          *:GHReview-files*
-  Show changed files in a fuzzy finder picker with file preview.
+  Toggle file tree sidebar showing changed files.
   Requires snacks.nvim.
 
 :GHReview comments                       *:GHReview-comments*
-  Show all review comment threads in a fuzzy finder picker with
-  thread preview. Requires snacks.nvim.
+  Toggle bottom panel showing all review comment threads
+  (powered by trouble.nvim).
 
 :GHReview hover                          *:GHReview-hover*
   Show the comment thread at or near cursor (within 3 lines).
@@ -129,9 +131,9 @@ All keybindings are under `<leader>gp` by default.
 
 Normal mode:~
 
-  `<leader>gpo`   Checkout PR (prompts for number)
-  `<leader>gpf`   Show changed files list
-  `<leader>gpc`   Show all comments list
+  `<leader>gpo`   Checkout PR (opens fuzzy picker, or prompts if no snacks)
+  `<leader>gpf`   Toggle file tree sidebar
+  `<leader>gpc`   Toggle comments panel
   `<leader>gpr`   Reply to thread at/near cursor
   `<leader>gpn`   New inline comment thread at cursor
   `<leader>gpt`   Toggle resolve/unresolve thread
@@ -162,9 +164,20 @@ Add the component to your lualine config: >lua
   })
 <
 
-Diffview~
-Files opened from the files window use diffview for side-by-side diffs
-against the PR merge base.
+Diff Review~
+Comment navigation (picker selection, `]c`/`[c`, comment threads) and the
+files picker open a native Neovim diff split: the working file on the right
+(modifiable) and the base version (`git show <base_ref>:<path>`) on the
+left (readonly scratch buffer). Both windows use `:diffthis` for built-in
+diff highlighting, folds, and scrollbind.
+
+All comment threads for the file are rendered as virtual lines (extmarks)
+below their respective lines on the right buffer. The focused thread is
+highlighted with `GHReviewInlineFocused` (links to `CurSearch` by default).
+
+Diffview (optional)~
+If diffview.nvim is installed, you can still open it manually for a full
+PR overview. It is no longer used for comment navigation.
 
 Which-key~
 The `<leader>gp` group is automatically registered if which-key is installed.

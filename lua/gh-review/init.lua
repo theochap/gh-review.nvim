@@ -62,6 +62,14 @@ function M._load_pr_data(pr_number, callback)
     -- Refresh diagnostics
     diagnostics.refresh_all()
 
+    -- Refresh trouble if open
+    pcall(function()
+      local trouble = require("trouble")
+      if trouble.is_open("gh_review") then
+        trouble.refresh("gh_review")
+      end
+    end)
+
     vim.notify("GHReview: loaded " .. #state.get_files() .. " files, " .. #state.get_threads() .. " threads", vim.log.levels.INFO)
 
     if callback then callback() end
@@ -197,31 +205,45 @@ end
 --- Close the review session
 function M.close()
   diagnostics.clear_all()
+  require("gh-review.ui.diff_review").close()
+  -- Close file sidebar if open
+  pcall(function()
+    local Snacks = require("snacks")
+    local pickers = Snacks.picker.get({ source = "gh_review_files" })
+    for _, p in ipairs(pickers) do p:close() end
+  end)
+  -- Close trouble comments panel if open
+  pcall(function() require("trouble").close("gh_review") end)
   require("gh-review.integrations.diffview").close()
   state.clear()
   vim.notify("GHReview: review session closed", vim.log.levels.INFO)
 end
 
---- Show changed files window
+--- Toggle file tree sidebar
 function M.files()
   if not state.is_active() then
     vim.notify("GHReview: no active review", vim.log.levels.WARN)
     return
   end
-  require("gh-review.ui.files").show()
+  require("gh-review.ui.files").toggle()
 end
 
---- Show all comments list
+--- Toggle comments panel (open / focus / close cycle)
 function M.comments()
   if not state.is_active() then
     vim.notify("GHReview: no active review", vim.log.levels.WARN)
     return
   end
-  require("gh-review.ui.comments").show_all({
-    on_goto = function(thread)
-      M._goto_thread(thread)
-    end,
-  })
+  local trouble = require("trouble")
+  if trouble.is_open("gh_review") then
+    if vim.bo.filetype == "trouble" then
+      trouble.close("gh_review")
+    else
+      trouble.focus("gh_review")
+    end
+  else
+    trouble.open("gh_review")
+  end
 end
 
 --- Show comment thread at or near cursor
@@ -284,23 +306,17 @@ function M._goto_thread(thread)
   local line = thread.mapped_line or thread.line
   if not line then return end
 
-  -- Open the file
-  local filepath = vim.fn.getcwd() .. "/" .. thread.path
-  if vim.fn.filereadable(filepath) == 1 then
-    vim.cmd("edit " .. vim.fn.fnameescape(filepath))
-    vim.api.nvim_win_set_cursor(0, { line, 0 })
-    vim.cmd("normal! zz")
-  end
+  require("gh-review.ui.diff_review").open(thread.path, line)
 
-  -- Show thread popup
-  require("gh-review.ui.comments").show_thread(thread, {
-    on_reply = function()
-      M._reply_to_thread(thread)
-    end,
-    on_resolve = function()
-      M._toggle_resolve(thread)
-    end,
-  })
+  vim.schedule(function()
+    -- If trouble panel is open, it auto-follows; otherwise show floating popup
+    if not require("trouble").is_open("gh_review") then
+      require("gh-review.ui.comments").show_thread(thread, {
+        on_reply = function() M._reply_to_thread(thread) end,
+        on_resolve = function() M._toggle_resolve(thread) end,
+      })
+    end
+  end)
 end
 
 --- Jump to next comment in current file
@@ -523,15 +539,35 @@ function M._toggle_resolve(thread)
   end)
 end
 
+--- Checkout a PR by number, or open the PR picker if no number given
+---@param pr_number? number
+function M.checkout_or_pick(pr_number)
+  if pr_number then
+    M.checkout(pr_number)
+    return
+  end
+  require("gh-review.ui.pr_picker").show({
+    on_select = function(n)
+      M.checkout(n)
+    end,
+  })
+end
+
 --- Get current buffer's path relative to cwd
 ---@return string?
 function M._current_rel_path()
   local filepath = vim.api.nvim_buf_get_name(0)
-  if filepath == "" then return nil end
+  if filepath == "" then
+    -- May be in diff review base window
+    return require("gh-review.ui.diff_review").get_file_path()
+  end
   local cwd = vim.fn.getcwd()
   if filepath:sub(1, #cwd) == cwd then
     return filepath:sub(#cwd + 2)
   end
+  -- Check if we're in a ghreview:// buffer
+  local review_path = filepath:match("^ghreview://base/(.+)$")
+  if review_path then return review_path end
   return filepath
 end
 
@@ -546,14 +582,11 @@ function M._setup_keymaps()
   end
 
   map(km.checkout, function()
-    vim.ui.input({ prompt = "PR number: " }, function(input)
-      local n = tonumber(input)
-      if n then M.checkout(n) end
-    end)
+    M.checkout_or_pick()
   end, "Checkout PR")
 
-  map(km.files, M.files, "Changed files")
-  map(km.comments, M.comments, "All comments")
+  map(km.files, M.files, "Toggle file tree")
+  map(km.comments, M.comments, "Toggle comments panel")
   map(km.reply, M.reply, "Reply to thread")
   map(km.new_thread, M.new_thread, "New comment thread")
   map(km.toggle_resolve, M.resolve, "Toggle resolve")
