@@ -71,63 +71,40 @@ local function build_items(files, cwd)
 
   -- Flatten into items with parent references
   local items = {}
-  local last_child = {} -- tracks last child per parent for `last` flag
 
   local function walk(node, parent_item)
     if not node.children then return end
-    local dirs, leaves = {}, {}
+    -- Sort: directories first, then files
+    local sorted = {}
     for _, child in ipairs(node.children) do
-      if child.children then
-        table.insert(dirs, child)
-      else
-        table.insert(leaves, child)
-      end
+      table.insert(sorted, child)
     end
-    table.sort(dirs, function(a, b) return a.name < b.name end)
-    table.sort(leaves, function(a, b) return a.name < b.name end)
+    table.sort(sorted, function(a, b)
+      local a_dir = a.children and 0 or 1
+      local b_dir = b.children and 0 or 1
+      if a_dir ~= b_dir then return a_dir < b_dir end
+      return a.name < b.name
+    end)
 
-    local all = {}
-    for _, d in ipairs(dirs) do table.insert(all, d) end
-    for _, f in ipairs(leaves) do table.insert(all, f) end
+    for idx, child in ipairs(sorted) do
+      local is_dir = child.children ~= nil
+      local file = not is_dir and child.file or nil
+      local icon, hl
+      if file then icon, hl = status_display(file.status) end
 
-    for idx, child in ipairs(all) do
-      if child.children then
-        -- Directory item
-        local item = {
-          text = child.name,
-          parent = parent_item,
-          last = idx == #all,
-          _is_dir = true,
-          _name = child.name,
-        }
-        -- Unset previous last sibling
-        if last_child[parent_item] then
-          last_child[parent_item].last = false
-        end
-        last_child[parent_item] = item
-        table.insert(items, item)
-        walk(child, item)
-      else
-        -- File item
-        local file = child.file
-        local icon, hl = status_display(file.status)
-        local item = {
-          text = file.path,
-          file = cwd .. "/" .. file.path,
-          parent = parent_item,
-          last = idx == #all,
-          _file_data = file,
-          _is_dir = false,
-          _name = child.name,
-          _icon = icon,
-          _hl = hl,
-        }
-        if last_child[parent_item] then
-          last_child[parent_item].last = false
-        end
-        last_child[parent_item] = item
-        table.insert(items, item)
-      end
+      local item = {
+        text = is_dir and child.name or file.path,
+        file = not is_dir and (cwd .. "/" .. file.path) or nil,
+        parent = parent_item,
+        last = idx == #sorted,
+        _is_dir = is_dir,
+        _name = child.name,
+        _file_data = file,
+        _icon = icon,
+        _hl = hl,
+      }
+      items[#items + 1] = item
+      if is_dir then walk(child, item) end
     end
   end
 

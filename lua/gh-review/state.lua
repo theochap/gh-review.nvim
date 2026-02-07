@@ -112,6 +112,30 @@ function M.get_thread_at(path, line)
   return nil
 end
 
+--- Get thread at or nearest to cursor (within max_dist lines)
+---@param path string
+---@param line number
+---@param max_dist? number defaults to 3
+---@return GHReviewThread?
+function M.get_nearest_thread(path, line, max_dist)
+  -- Exact match first
+  local exact = M.get_thread_at(path, line)
+  if exact then return exact end
+
+  max_dist = max_dist or 3
+  local best, best_dist = nil, max_dist + 1
+  for _, thread in ipairs(M.get_threads_for_file(path)) do
+    if thread.mapped_line then
+      local dist = math.abs(thread.mapped_line - line)
+      if dist < best_dist then
+        best_dist = dist
+        best = thread
+      end
+    end
+  end
+  return best
+end
+
 function M.set_pr_comments(comments)
   state.pr_comments = comments
 end

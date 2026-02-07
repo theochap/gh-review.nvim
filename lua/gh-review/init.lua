@@ -256,39 +256,13 @@ function M.show_hover()
   local rel_path = M._current_rel_path()
   if not rel_path then return end
 
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-
-  -- Exact match first
-  local thread = state.get_thread_at(rel_path, cursor_line)
-
-  -- If no exact match, search within 3 lines
-  if not thread then
-    local threads = state.get_threads_for_file(rel_path)
-    local min_dist = 4 -- only consider within 3 lines
-    for _, t in ipairs(threads) do
-      if t.mapped_line then
-        local dist = math.abs(t.mapped_line - cursor_line)
-        if dist < min_dist then
-          min_dist = dist
-          thread = t
-        end
-      end
-    end
-  end
-
+  local thread = state.get_nearest_thread(rel_path, vim.api.nvim_win_get_cursor(0)[1])
   if not thread then
     vim.notify("GHReview: no comment thread near cursor", vim.log.levels.INFO)
     return
   end
 
-  require("gh-review.ui.comments").show_thread(thread, {
-    on_reply = function()
-      M._reply_to_thread(thread)
-    end,
-    on_resolve = function()
-      M._toggle_resolve(thread)
-    end,
-  })
+  M._show_thread_popup(thread)
 end
 
 --- Show PR description page
@@ -298,6 +272,15 @@ function M.description()
     return
   end
   require("gh-review.ui.description").show()
+end
+
+--- Show thread in a floating popup with reply/resolve actions
+---@param thread table GHReviewThread
+function M._show_thread_popup(thread)
+  require("gh-review.ui.comments").show_thread(thread, {
+    on_reply = function() M._reply_to_thread(thread) end,
+    on_resolve = function() M._toggle_resolve(thread) end,
+  })
 end
 
 --- Navigate to a thread location and show it
@@ -311,10 +294,7 @@ function M._goto_thread(thread)
   vim.schedule(function()
     -- If trouble panel is open, it auto-follows; otherwise show floating popup
     if not require("trouble").is_open("gh_review") then
-      require("gh-review.ui.comments").show_thread(thread, {
-        on_reply = function() M._reply_to_thread(thread) end,
-        on_resolve = function() M._toggle_resolve(thread) end,
-      })
+      M._show_thread_popup(thread)
     end
   end)
 end
@@ -397,23 +377,7 @@ function M.reply()
   end
 
   local rel_path = M._current_rel_path()
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local thread = state.get_thread_at(rel_path, cursor_line)
-
-  if not thread then
-    -- Find nearest thread
-    local threads = state.get_threads_for_file(rel_path)
-    local min_dist = math.huge
-    for _, t in ipairs(threads) do
-      if t.mapped_line then
-        local dist = math.abs(t.mapped_line - cursor_line)
-        if dist < min_dist then
-          min_dist = dist
-          thread = t
-        end
-      end
-    end
-  end
+  local thread = state.get_nearest_thread(rel_path, vim.api.nvim_win_get_cursor(0)[1], math.huge)
 
   if not thread then
     vim.notify("GHReview: no comment thread at cursor", vim.log.levels.WARN)
@@ -468,22 +432,7 @@ function M.resolve()
   end
 
   local rel_path = M._current_rel_path()
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local thread = state.get_thread_at(rel_path, cursor_line)
-
-  if not thread then
-    local threads = state.get_threads_for_file(rel_path)
-    local min_dist = math.huge
-    for _, t in ipairs(threads) do
-      if t.mapped_line then
-        local dist = math.abs(t.mapped_line - cursor_line)
-        if dist < min_dist then
-          min_dist = dist
-          thread = t
-        end
-      end
-    end
-  end
+  local thread = state.get_nearest_thread(rel_path, vim.api.nvim_win_get_cursor(0)[1], math.huge)
 
   if not thread then
     vim.notify("GHReview: no thread to resolve", vim.log.levels.WARN)
@@ -581,9 +530,7 @@ function M._setup_keymaps()
     vim.keymap.set("n", prefix .. suffix, fn, vim.tbl_extend("force", opts, { desc = desc }))
   end
 
-  map(km.checkout, function()
-    M.checkout_or_pick()
-  end, "Checkout PR")
+  map(km.checkout, M.checkout_or_pick, "Checkout PR")
 
   map(km.files, M.files, "Toggle file tree")
   map(km.comments, M.comments, "Toggle comments panel")

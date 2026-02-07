@@ -1,7 +1,6 @@
---- Comment thread floating window and all-comments picker
+--- Comment thread floating window
 local M = {}
 
-local state = require("gh-review.state")
 local config = require("gh-review.config")
 
 --- Format a timestamp for display
@@ -111,8 +110,7 @@ function M.show_thread(thread, opts)
     end
   end, kopts)
 
-  -- Auto-close on CursorMoved in the parent window
-  local parent_win = vim.fn.win_getid(vim.fn.winnr("#"))
+  -- Auto-close on CursorMoved in another window
   vim.api.nvim_create_autocmd("CursorMoved", {
     callback = function()
       if vim.api.nvim_get_current_win() ~= win and vim.api.nvim_win_is_valid(win) then
@@ -123,94 +121,6 @@ function M.show_thread(thread, opts)
   })
 
   return win, buf
-end
-
---- Build preview lines for a thread
----@param thread table GHReviewThread
----@return string[]
-local function build_thread_preview(thread)
-  local lines = {}
-  local status = thread.is_resolved and " [RESOLVED]" or ""
-  table.insert(lines, "── Thread" .. status .. " ──")
-  table.insert(lines, "File: " .. thread.path .. ":" .. (thread.mapped_line or thread.line or "?"))
-  table.insert(lines, "")
-
-  for i, comment in ipairs(thread.comments) do
-    local date = format_time(comment.created_at)
-    table.insert(lines, "@" .. comment.author .. "  " .. date)
-    for body_line in comment.body:gmatch("[^\n]*") do
-      table.insert(lines, "  " .. body_line)
-    end
-    if i < #thread.comments then
-      table.insert(lines, "")
-    end
-  end
-
-  return lines
-end
-
---- Show all comments in a snacks picker with thread preview
----@param opts? { on_goto?: fun(thread: table) }
-function M.show_all(opts)
-  opts = opts or {}
-  local threads = state.get_threads()
-  if #threads == 0 then
-    vim.notify("No review comments", vim.log.levels.INFO)
-    return
-  end
-
-  local ok, Snacks = pcall(require, "snacks")
-  if not ok then
-    vim.notify("GHReview: snacks.nvim required for comments picker", vim.log.levels.ERROR)
-    return
-  end
-
-  local items = {}
-  for _, thread in ipairs(threads) do
-    local first = thread.comments[1]
-    local author = first and first.author or "?"
-    local body = first and first.body:match("^([^\n]+)") or ""
-    if #body > 80 then
-      body = body:sub(1, 77) .. "..."
-    end
-    local resolved = thread.is_resolved and " ✓" or ""
-    local loc = thread.path .. ":" .. (thread.mapped_line or thread.line or 0)
-
-    table.insert(items, {
-      text = loc .. " @" .. author .. " " .. body,
-      _thread = thread,
-      _author = author,
-      _body = body,
-      _resolved = resolved,
-      _loc = loc,
-    })
-  end
-
-  Snacks.picker.pick({
-    title = "PR Comments",
-    items = items,
-    format = function(item, picker)
-      return {
-        { item._loc, "Directory" },
-        { "  @" .. item._author .. item._resolved, "Special" },
-        { "  " .. item._body, "Comment", virtual = true },
-      }
-    end,
-    preview = function(ctx)
-      local item = ctx.item
-      if not item or not item._thread then return end
-      local lines = build_thread_preview(item._thread)
-      ctx.preview:set_lines(lines)
-      ctx.preview:highlight({ ft = "markdown" })
-    end,
-    confirm = function(picker, item)
-      if not item then return end
-      picker:close()
-      if opts.on_goto and item._thread then
-        opts.on_goto(item._thread)
-      end
-    end,
-  })
 end
 
 return M
