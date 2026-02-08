@@ -20,6 +20,8 @@ local M = {}
 ---@field close string
 ---@field hover string
 ---@field description string
+---@field toggle_overlay string
+---@field open_minidiff string
 ---@field next_comment string
 ---@field prev_comment string
 
@@ -57,6 +59,8 @@ M.defaults = {
     close = "q",
     hover = "v",
     description = "d",
+    toggle_overlay = "D",
+    open_minidiff = "e",
     next_comment = "]c",
     prev_comment = "[c",
   },

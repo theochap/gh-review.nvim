@@ -35,6 +35,7 @@ function M.check()
     { name = "lualine.nvim", module = "lualine" },
     { name = "which-key.nvim", module = "which-key" },
     { name = "trouble.nvim", module = "trouble" },
+    { name = "mini.diff", module = "mini.diff" },
   }
   for _, dep in ipairs(deps) do
     local ok, _ = pcall(require, dep.module)

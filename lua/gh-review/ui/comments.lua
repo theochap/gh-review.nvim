@@ -80,6 +80,10 @@ function M.show_thread(thread, opts)
     title_pos = "center",
   })
 
+  -- Enable word wrap at word boundaries
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+
   -- Buffer-local keymaps
   local kopts = { buffer = buf, nowait = true, silent = true }
 

@@ -11,16 +11,7 @@ vim.api.nvim_create_user_command("GHReview", function(opts)
 
   if cmd == "checkout" then
     local pr_num = tonumber(args[2])
-    if not pr_num then
-      vim.ui.input({ prompt = "PR number: " }, function(input)
-        local n = tonumber(input)
-        if n then
-          gh_review.checkout(n)
-        end
-      end)
-    else
-      gh_review.checkout(pr_num)
-    end
+    gh_review.checkout_or_pick(pr_num)
   elseif cmd == "files" then
     gh_review.files()
   elseif cmd == "comments" then

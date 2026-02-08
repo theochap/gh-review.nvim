@@ -30,6 +30,7 @@ GitHub GraphQL API.
 
 Optional:~
 - diffview.nvim — for side-by-side diffs
+- mini.diff — for gutter signs and inline diff overlay on PR files
 - lualine.nvim — for statusline integration
 - which-key.nvim — for keymap discovery
 - trouble.nvim — for diagnostics list
@@ -68,6 +69,8 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
       toggle_resolve = "t",
       hover = "v",
       description = "d",
+      toggle_overlay = "D",
+      open_minidiff = "e",
       refresh = "R",
       close = "q",
       next_comment = "]c",
@@ -139,6 +142,8 @@ Normal mode:~
   `<leader>gpt`   Toggle resolve/unresolve thread
   `<leader>gpv`   View comment at/near cursor
   `<leader>gpd`   PR description page
+  `<leader>gpD`   Toggle mini.diff inline overlay
+  `<leader>gpe`   Open file with diff overlay (close split, use mini.diff)
   `<leader>gpR`   Refresh PR data
   `<leader>gpq`   Close review session
   `]c`            Next comment (falls through to gitsigns if no review)
@@ -147,6 +152,7 @@ Normal mode:~
 Buffer-local keymaps:~
 
 Comment thread:   `r` reply, `t` resolve, `o` browser, `q` close
+Trouble panel:    `r` reply, `t` resolve/unresolve, `<cr>` jump to diff
 Description:      `q` close, `o` open PR URL in browser
 Comment input:    `<C-s>` submit, `<Esc><Esc>` cancel
 
@@ -174,6 +180,13 @@ diff highlighting, folds, and scrollbind.
 All comment threads for the file are rendered as virtual lines (extmarks)
 below their respective lines on the right buffer. The focused thread is
 highlighted with `GHReviewInlineFocused` (links to `CurSearch` by default).
+
+Mini.diff (optional)~
+When mini.diff is installed, opening any file that belongs to the active PR
+automatically sets the PR base version as the reference text. This gives you
+gutter signs (added/changed/deleted) without any extra steps. Use
+`<leader>gpD` to toggle an inline overlay showing the full diff as virtual
+text in the current buffer.
 
 Diffview (optional)~
 If diffview.nvim is installed, you can still open it manually for a full

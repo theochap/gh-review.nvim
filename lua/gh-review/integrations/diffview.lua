@@ -8,13 +8,13 @@ local state = require("gh-review.state")
 function M.open(file_path)
   local ok, _ = pcall(require, "diffview")
   if not ok then
-    vim.notify("diffview.nvim is required for diff view", vim.log.levels.ERROR)
+    vim.notify("GHReview: diffview.nvim not installed", vim.log.levels.WARN)
     return
   end
 
   local pr = state.get_pr()
   if not pr then
-    vim.notify("No active PR review", vim.log.levels.WARN)
+    vim.notify("GHReview: no active review", vim.log.levels.WARN)
     return
   end
 

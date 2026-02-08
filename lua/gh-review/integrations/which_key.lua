@@ -21,6 +21,8 @@ function M.register()
     { prefix .. "t", desc = "Toggle resolve" },
     { prefix .. "v", desc = "View comment at cursor" },
     { prefix .. "d", desc = "PR description" },
+    { prefix .. "D", desc = "Toggle diff overlay" },
+    { prefix .. "e", desc = "Open file with diff overlay" },
     { prefix .. "R", desc = "Refresh PR data" },
     { prefix .. "q", desc = "Close review" },
   })

@@ -2,6 +2,15 @@
 local Item = require("trouble.item")
 local M = {}
 
+--- Extract thread from a trouble node
+---@param self table trouble view
+---@return table? thread
+function M._get_thread(self)
+  local node = self:at()
+  if not node or not node.item then return nil end
+  return node.item.item and node.item.item.thread
+end
+
 M.config = {
   modes = {
     gh_review = {
@@ -13,18 +22,28 @@ M.config = {
       sort = { "filename", "pos" },
       format = "{severity_icon} {message:md} {pos}",
       auto_preview = false,
+      win = {
+        wo = { wrap = true, linebreak = true },
+      },
       keys = {
         ["<cr>"] = function(self)
-          local node = self:at()
-          if not node or not node.item then return end
-          local thread = node.item.item and node.item.item.thread
+          local thread = M._get_thread(self)
           if not thread then return end
-          -- Focus the previous (main) window, then open diff there
           vim.cmd("wincmd p")
           require("gh-review.ui.diff_review").open(
             thread.path,
             thread.mapped_line or thread.line
           )
+        end,
+        ["r"] = function(self)
+          local thread = M._get_thread(self)
+          if not thread then return end
+          require("gh-review")._reply_to_thread(thread)
+        end,
+        ["t"] = function(self)
+          local thread = M._get_thread(self)
+          if not thread then return end
+          require("gh-review")._toggle_resolve(thread)
         end,
       },
     },

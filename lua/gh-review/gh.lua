@@ -122,6 +122,28 @@ function M.pr_comments(pr_number, callback)
   end)
 end
 
+--- List open PRs for the current repo
+---@param callback fun(err: string?, prs: table?)
+function M.pr_list(callback)
+  local fields = "number,title,author,body,state,headRefName,isDraft,createdAt,reviewDecision"
+  M.run({
+    "pr", "list",
+    "--json", fields,
+    "--limit", "50",
+  }, function(err, output)
+    if err then
+      callback(err, nil)
+      return
+    end
+    local ok, data = pcall(vim.json.decode, output)
+    if not ok then
+      callback("Failed to parse PR list JSON: " .. tostring(data), nil)
+      return
+    end
+    callback(nil, data)
+  end)
+end
+
 --- Get repository owner/name
 ---@param callback fun(err: string?, repo: string?)
 function M.repo_name(callback)

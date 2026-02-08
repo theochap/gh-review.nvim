@@ -84,6 +84,7 @@ function M.setup()
     callback = function(args)
       if state.is_active() and vim.bo[args.buf].buftype == "" then
         M.refresh_buf(args.buf)
+        require("gh-review.ui.minidiff").attach(args.buf)
       end
     end,
   })

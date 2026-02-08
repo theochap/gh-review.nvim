@@ -4,7 +4,7 @@ local M = {}
 local config = require("gh-review.config")
 
 --- Open a scratch buffer for composing a comment
----@param opts { title: string, on_submit: fun(body: string), on_cancel?: fun() }
+---@param opts { title: string, on_submit: fun(body: string), on_cancel?: fun(), context_lines?: string[] }
 function M.open(opts)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].buftype = "nofile"
@@ -13,7 +13,19 @@ function M.open(opts)
 
   local cfg = config.get()
   local width = math.min(80, cfg.float.max_width)
-  local height = math.min(15, cfg.float.max_height)
+
+  -- Build initial content with optional context (e.g. thread being replied to)
+  local input_start = 0
+  if opts.context_lines and #opts.context_lines > 0 then
+    local init_lines = vim.list_extend({}, opts.context_lines)
+    table.insert(init_lines, string.rep("─", width - 4))
+    table.insert(init_lines, "")
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, init_lines)
+    input_start = #init_lines - 1 -- 0-indexed line of the empty input line
+  end
+
+  local context_height = input_start > 0 and math.min(input_start, 20) or 0
+  local height = math.min(15 + context_height, cfg.float.max_height)
 
   local win = vim.api.nvim_open_win(buf, true, {
     relative = "editor",
@@ -28,6 +40,19 @@ function M.open(opts)
     footer = " Ctrl-S: submit | Esc Esc: cancel ",
     footer_pos = "center",
   })
+
+  -- Enable word wrap
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+
+  -- Highlight context lines as dimmed
+  if input_start > 0 then
+    local ns = vim.api.nvim_create_namespace("gh_review_input_ctx")
+    for i = 0, input_start - 1 do -- dim context lines and separator
+      vim.api.nvim_buf_add_highlight(buf, ns, "Comment", i, 0, -1)
+    end
+    vim.api.nvim_win_set_cursor(win, { input_start + 1, 0 }) -- 1-indexed
+  end
 
   -- Start in insert mode
   vim.cmd("startinsert")
@@ -47,7 +72,7 @@ function M.open(opts)
   -- Submit: Ctrl-S
   for _, mode in ipairs({ "n", "i" }) do
     vim.keymap.set(mode, "<C-s>", function()
-      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local lines = vim.api.nvim_buf_get_lines(buf, input_start, -1, false)
       local body = vim.trim(table.concat(lines, "\n"))
       close()
       if body ~= "" then

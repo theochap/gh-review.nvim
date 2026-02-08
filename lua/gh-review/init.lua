@@ -202,8 +202,49 @@ function M.refresh(callback)
   M._load_pr_data(pr.number, callback)
 end
 
+--- Open current diff file in a normal buffer with mini.diff overlay
+function M.open_minidiff()
+  if not state.is_active() then
+    vim.notify("GHReview: no active review", vim.log.levels.WARN)
+    return
+  end
+
+  local diff_review = require("gh-review.ui.diff_review")
+  local file_path = diff_review.get_file_path()
+  if not file_path then
+    file_path = M._current_rel_path()
+  end
+  if not file_path then
+    vim.notify("GHReview: no file to open", vim.log.levels.WARN)
+    return
+  end
+
+  -- Close diff split if open
+  diff_review.close()
+
+  -- Open the file normally
+  local cwd = vim.fn.getcwd()
+  vim.cmd("edit " .. vim.fn.fnameescape(cwd .. "/" .. file_path))
+
+  -- Attach mini.diff and turn on overlay
+  local minidiff = require("gh-review.ui.minidiff")
+  local buf = vim.api.nvim_get_current_buf()
+  minidiff.attach(buf)
+  minidiff.toggle_overlay()
+end
+
+--- Toggle mini.diff overlay on current buffer
+function M.toggle_overlay()
+  if not state.is_active() then
+    vim.notify("GHReview: no active review", vim.log.levels.WARN)
+    return
+  end
+  require("gh-review.ui.minidiff").toggle_overlay()
+end
+
 --- Close the review session
 function M.close()
+  require("gh-review.ui.minidiff").detach_all()
   diagnostics.clear_all()
   require("gh-review.ui.diff_review").close()
   -- Close file sidebar if open
@@ -455,8 +496,21 @@ function M._reply_to_thread(thread)
   local preview = first and first.body:match("^([^\n]+)") or ""
   if #preview > 50 then preview = preview:sub(1, 47) .. "..." end
 
+  -- Build context showing the full thread being replied to
+  local context_lines = {}
+  for i, comment in ipairs(thread.comments) do
+    table.insert(context_lines, "@" .. comment.author .. ":")
+    for body_line in comment.body:gmatch("[^\n]*") do
+      table.insert(context_lines, "  " .. body_line)
+    end
+    if i < #thread.comments then
+      table.insert(context_lines, "")
+    end
+  end
+
   require("gh-review.ui.comment_input").open({
     title = "Reply: " .. preview,
+    context_lines = context_lines,
     on_submit = function(body)
       vim.notify("GHReview: posting reply...", vim.log.levels.INFO)
       graphql.reply_to_thread(pr.node_id, thread.id, body, function(err)
@@ -539,6 +593,8 @@ function M._setup_keymaps()
   map(km.toggle_resolve, M.resolve, "Toggle resolve")
   map(km.hover, M.show_hover, "View comment at cursor")
   map(km.description, M.description, "PR description")
+  map(km.toggle_overlay, M.toggle_overlay, "Toggle diff overlay")
+  map(km.open_minidiff, M.open_minidiff, "Open file with diff overlay")
   map(km.refresh, M.refresh, "Refresh PR data")
   map(km.close, M.close, "Close review")
 
