@@ -19,6 +19,39 @@ function M.setup(user_config)
   vim.schedule(function()
     require("gh-review.integrations.which_key").register()
   end)
+
+  -- Auto-detect PR for current branch after startup
+  M._schedule_pr_detection()
+end
+
+--- Check if the current branch has an open PR and notify the user
+M._pr_detection_notified = false
+
+function M._schedule_pr_detection()
+  local function check()
+    if M._pr_detection_notified or state.is_active() then return end
+    gh.pr_view_current(function(err, data)
+      if err or not data then return end
+      if M._pr_detection_notified or state.is_active() then return end
+      M._pr_detection_notified = true
+      local km = config.get().keymaps
+      vim.notify(
+        string.format("GHReview: PR #%d found — %s (use %s%s to review)", data.number, data.title, km.prefix, km.review_current),
+        vim.log.levels.INFO
+      )
+    end)
+  end
+
+  if vim.v.vim_did_enter == 1 then
+    -- Plugin loaded after startup (e.g. by lazy.nvim) — defer directly
+    vim.defer_fn(check, 100)
+  else
+    -- Plugin loaded during startup — wait for VimEnter
+    vim.api.nvim_create_autocmd("VimEnter", {
+      callback = function() vim.defer_fn(check, 100) end,
+      once = true,
+    })
+  end
 end
 
 --- Checkout a PR and load all review data
