@@ -12,6 +12,8 @@ vim.api.nvim_create_user_command("GHReview", function(opts)
   if cmd == "checkout" then
     local pr_num = tonumber(args[2])
     gh_review.checkout_or_pick(pr_num)
+  elseif cmd == "current" then
+    gh_review.review_current()
   elseif cmd == "files" then
     gh_review.files()
   elseif cmd == "comments" then
@@ -26,12 +28,12 @@ vim.api.nvim_create_user_command("GHReview", function(opts)
     gh_review.close()
   else
     vim.notify("GHReview: unknown command '" .. (cmd or "") .. "'", vim.log.levels.ERROR)
-    vim.notify("Usage: GHReview checkout|files|comments|hover|description|refresh|close", vim.log.levels.INFO)
+    vim.notify("Usage: GHReview checkout|current|files|comments|hover|description|refresh|close", vim.log.levels.INFO)
   end
 end, {
   nargs = "*",
   complete = function(_, line)
-    local subcmds = { "checkout", "files", "comments", "hover", "description", "refresh", "close" }
+    local subcmds = { "checkout", "current", "files", "comments", "hover", "description", "refresh", "close" }
     local args = vim.split(line, "%s+")
     if #args <= 2 then
       return vim.tbl_filter(function(s)

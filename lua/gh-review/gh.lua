@@ -122,6 +122,27 @@ function M.pr_comments(pr_number, callback)
   end)
 end
 
+--- Get PR metadata for the current branch (no PR number needed)
+---@param callback fun(err: string?, data: table?)
+function M.pr_view_current(callback)
+  local fields = "number,title,author,baseRefName,headRefName,url,reviewDecision,body"
+  M.run({
+    "pr", "view",
+    "--json", fields,
+  }, function(err, output)
+    if err then
+      callback(err, nil)
+      return
+    end
+    local ok, data = pcall(vim.json.decode, output)
+    if not ok then
+      callback("Failed to parse PR JSON: " .. tostring(data), nil)
+      return
+    end
+    callback(nil, data)
+  end)
+end
+
 --- List open PRs for the current repo
 ---@param callback fun(err: string?, prs: table?)
 function M.pr_list(callback)

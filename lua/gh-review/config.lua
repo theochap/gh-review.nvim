@@ -22,6 +22,7 @@ local M = {}
 ---@field description string
 ---@field toggle_overlay string
 ---@field open_minidiff string
+---@field review_current string
 ---@field next_comment string
 ---@field prev_comment string
 
@@ -61,6 +62,7 @@ M.defaults = {
     description = "d",
     toggle_overlay = "D",
     open_minidiff = "e",
+    review_current = "O",
     next_comment = "]c",
     prev_comment = "[c",
   },

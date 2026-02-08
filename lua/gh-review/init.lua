@@ -542,6 +542,25 @@ function M._toggle_resolve(thread)
   end)
 end
 
+--- Review the PR associated with the current branch
+function M.review_current()
+  if state.is_active() then
+    vim.notify("GHReview: review already active, close first", vim.log.levels.WARN)
+    return
+  end
+  vim.notify("GHReview: detecting PR for current branch...", vim.log.levels.INFO)
+  gh.pr_view_current(function(err, data)
+    if err then
+      vim.notify("GHReview: no PR for current branch: " .. err, vim.log.levels.ERROR)
+      return
+    end
+    vim.schedule(function()
+      vim.notify("GHReview: loading PR #" .. data.number .. " — " .. data.title, vim.log.levels.INFO)
+      M._load_pr_data(data.number)
+    end)
+  end)
+end
+
 --- Checkout a PR by number, or open the PR picker if no number given
 ---@param pr_number? number
 function M.checkout_or_pick(pr_number)
@@ -585,6 +604,7 @@ function M._setup_keymaps()
   end
 
   map(km.checkout, M.checkout_or_pick, "Checkout PR")
+  map(km.review_current, M.review_current, "Review PR for current branch")
 
   map(km.files, M.files, "Toggle file tree")
   map(km.comments, M.comments, "Toggle comments panel")

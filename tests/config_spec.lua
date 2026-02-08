@@ -12,6 +12,7 @@ describe("config", function()
       local km = config.get().keymaps
       assert.is_not_nil(km.prefix)
       assert.is_not_nil(km.checkout)
+      assert.is_not_nil(km.review_current)
       assert.is_not_nil(km.files)
       assert.is_not_nil(km.comments)
       assert.is_not_nil(km.reply)

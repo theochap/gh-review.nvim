@@ -62,6 +62,7 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
     keymaps = {
       prefix = "<leader>gp",       -- keymap prefix
       checkout = "o",
+      review_current = "O",
       files = "f",
       comments = "c",
       reply = "r",
@@ -106,6 +107,10 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
   fuzzy picker showing open PRs searchable by title, author, and description.
   Requires snacks.nvim for the picker.
 
+:GHReview current                        *:GHReview-current*
+  Detect the PR associated with the current branch and load review data.
+  No PR number is needed — uses `gh pr view` for the current branch.
+
 :GHReview files                          *:GHReview-files*
   Toggle file tree sidebar showing changed files.
   Requires snacks.nvim.
@@ -135,6 +140,7 @@ All keybindings are under `<leader>gp` by default.
 Normal mode:~
 
   `<leader>gpo`   Checkout PR (opens fuzzy picker, or prompts if no snacks)
+  `<leader>gpO`   Review PR for current branch (no checkout needed)
   `<leader>gpf`   Toggle file tree sidebar
   `<leader>gpc`   Toggle comments panel
   `<leader>gpr`   Reply to thread at/near cursor

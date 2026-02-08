@@ -14,6 +14,7 @@ function M.register()
   wk.add({
     { prefix, group = "PR Review" },
     { prefix .. "o", desc = "Checkout PR" },
+    { prefix .. "O", desc = "Review PR for current branch" },
     { prefix .. "f", desc = "Toggle file tree" },
     { prefix .. "c", desc = "Toggle comments panel" },
     { prefix .. "r", desc = "Reply to thread" },
