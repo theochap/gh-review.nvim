@@ -24,6 +24,8 @@ describe("config", function()
       assert.is_not_nil(km.close)
       assert.is_not_nil(km.next_comment)
       assert.is_not_nil(km.prev_comment)
+      assert.is_not_nil(km.next_diff)
+      assert.is_not_nil(km.prev_diff)
     end)
 
     it("includes toggle_overlay keymap", function()

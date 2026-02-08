@@ -410,6 +410,150 @@ function M.prev_comment()
   end
 end
 
+--- Find the index of the currently open diff file in state.get_files()
+---@return number?, GHReviewFile[]? index (1-based) and files list, or nil if not found
+function M._get_current_file_index()
+  local diff_review = require("gh-review.ui.diff_review")
+  local file_path = diff_review.get_file_path()
+  if not file_path then return nil, nil end
+
+  local files = state.get_files()
+  for i, f in ipairs(files) do
+    if f.path == file_path then
+      return i, files
+    end
+  end
+  return nil, nil
+end
+
+--- Detect if cursor is at a boundary hunk (first or last) in the diff
+---@param direction string "next" or "prev"
+---@return boolean true if at boundary (no more hunks in this direction)
+function M._at_boundary_hunk(direction)
+  local diff_review = require("gh-review.ui.diff_review")
+  local work_win = diff_review.get_work_win()
+  if not work_win then return true end
+
+  local motion = direction == "next" and "]c" or "[c"
+
+  -- Save cursor, try the motion, compare, restore
+  local ok, at_boundary = pcall(function()
+    return vim.api.nvim_win_call(work_win, function()
+      local before = vim.api.nvim_win_get_cursor(0)
+      local moved = pcall(vim.cmd, "normal! " .. motion)
+      local after = vim.api.nvim_win_get_cursor(0)
+      -- Restore cursor
+      vim.api.nvim_win_set_cursor(0, before)
+      -- At boundary if motion failed or cursor didn't move
+      return not moved or (before[1] == after[1] and before[2] == after[2])
+    end)
+  end)
+
+  if not ok then return true end
+  return at_boundary
+end
+
+--- Jump to next diff hunk, crossing file boundaries
+function M.next_diff()
+  local diff_review = require("gh-review.ui.diff_review")
+
+  if not state.is_active() or not diff_review.is_diff_active() then
+    -- Fall through to native ]c
+    pcall(vim.cmd, "normal! ]c")
+    return
+  end
+
+  if not M._at_boundary_hunk("next") then
+    -- Still have hunks in this file — just do the motion
+    local work_win = diff_review.get_work_win()
+    if work_win then
+      vim.api.nvim_win_call(work_win, function()
+        vim.cmd("normal! ]c")
+      end)
+    end
+    return
+  end
+
+  -- At boundary — find next non-deleted file
+  local idx, files = M._get_current_file_index()
+  if not idx or not files then return end
+
+  local next_idx = nil
+  for i = idx + 1, #files do
+    if files[i].status ~= "deleted" then
+      next_idx = i
+      break
+    end
+  end
+
+  if not next_idx then
+    vim.notify("GHReview: last file in PR", vim.log.levels.INFO)
+    return
+  end
+
+  diff_review.open(files[next_idx].path)
+  vim.schedule(function()
+    local win = diff_review.get_work_win()
+    if win then
+      vim.api.nvim_win_call(win, function()
+        -- Go to top, then first hunk
+        vim.cmd("normal! gg")
+        pcall(vim.cmd, "normal! ]c")
+      end)
+    end
+  end)
+end
+
+--- Jump to previous diff hunk, crossing file boundaries
+function M.prev_diff()
+  local diff_review = require("gh-review.ui.diff_review")
+
+  if not state.is_active() or not diff_review.is_diff_active() then
+    -- Fall through to native [c
+    pcall(vim.cmd, "normal! [c")
+    return
+  end
+
+  if not M._at_boundary_hunk("prev") then
+    local work_win = diff_review.get_work_win()
+    if work_win then
+      vim.api.nvim_win_call(work_win, function()
+        vim.cmd("normal! [c")
+      end)
+    end
+    return
+  end
+
+  -- At boundary — find previous non-deleted file
+  local idx, files = M._get_current_file_index()
+  if not idx or not files then return end
+
+  local prev_idx = nil
+  for i = idx - 1, 1, -1 do
+    if files[i].status ~= "deleted" then
+      prev_idx = i
+      break
+    end
+  end
+
+  if not prev_idx then
+    vim.notify("GHReview: first file in PR", vim.log.levels.INFO)
+    return
+  end
+
+  diff_review.open(files[prev_idx].path)
+  vim.schedule(function()
+    local win = diff_review.get_work_win()
+    if win then
+      vim.api.nvim_win_call(win, function()
+        -- Go to bottom, then last hunk
+        vim.cmd("normal! G")
+        pcall(vim.cmd, "normal! [c")
+      end)
+    end
+  end)
+end
+
 --- Reply to the thread at cursor position
 function M.reply()
   if not state.is_active() then
@@ -621,6 +765,10 @@ function M._setup_keymaps()
   -- ]c / [c with fallthrough
   vim.keymap.set("n", km.next_comment, M.next_comment, { desc = "Next comment", silent = true })
   vim.keymap.set("n", km.prev_comment, M.prev_comment, { desc = "Prev comment", silent = true })
+
+  -- ]d / [d cross-file diff hunk navigation
+  vim.keymap.set("n", km.next_diff, M.next_diff, { desc = "Next diff hunk", silent = true })
+  vim.keymap.set("n", km.prev_diff, M.prev_diff, { desc = "Prev diff hunk", silent = true })
 end
 
 return M

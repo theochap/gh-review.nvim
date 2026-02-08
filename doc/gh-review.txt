@@ -76,6 +76,8 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
       close = "q",
       next_comment = "]c",
       prev_comment = "[c",
+      next_diff = "]d",
+      prev_diff = "[d",
     },
     icons = {
       added = "A",
@@ -154,6 +156,8 @@ Normal mode:~
   `<leader>gpq`   Close review session
   `]c`            Next comment (falls through to gitsigns if no review)
   `[c`            Previous comment
+  `]d`            Next diff hunk (crosses file boundaries)
+  `[d`            Previous diff hunk (crosses file boundaries)
 
 Buffer-local keymaps:~
 

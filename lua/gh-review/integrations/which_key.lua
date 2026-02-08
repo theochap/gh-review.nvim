@@ -26,6 +26,8 @@ function M.register()
     { prefix .. "e", desc = "Open file with diff overlay" },
     { prefix .. "R", desc = "Refresh PR data" },
     { prefix .. "q", desc = "Close review" },
+    { "]d", desc = "Next diff hunk (cross-file)" },
+    { "[d", desc = "Prev diff hunk (cross-file)" },
   })
 end
 

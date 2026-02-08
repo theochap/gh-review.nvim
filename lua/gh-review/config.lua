@@ -25,6 +25,8 @@ local M = {}
 ---@field review_current string
 ---@field next_comment string
 ---@field prev_comment string
+---@field next_diff string
+---@field prev_diff string
 
 ---@class GHReviewIcons
 ---@field added string
@@ -65,6 +67,8 @@ M.defaults = {
     review_current = "O",
     next_comment = "]c",
     prev_comment = "[c",
+    next_diff = "]d",
+    prev_diff = "[d",
   },
   icons = {
     added = "A",

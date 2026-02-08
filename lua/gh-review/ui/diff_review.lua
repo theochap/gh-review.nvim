@@ -135,6 +135,21 @@ function M.close()
 	current.work_win = nil
 end
 
+--- Check if a diff review is active with valid windows
+---@return boolean
+function M.is_diff_active()
+	return current.file_path ~= nil and win_valid(current.base_win) and win_valid(current.work_win)
+end
+
+--- Get the work (right-side) window handle
+---@return number?
+function M.get_work_win()
+	if win_valid(current.work_win) then
+		return current.work_win
+	end
+	return nil
+end
+
 --- Get the file path if we're in a diff review window
 ---@return string?
 function M.get_file_path()
