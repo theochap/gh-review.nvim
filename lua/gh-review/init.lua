@@ -468,7 +468,7 @@ function M.next_diff()
     local work_win = diff_review.get_work_win()
     if work_win then
       vim.api.nvim_win_call(work_win, function()
-        vim.cmd("normal! ]c")
+        vim.cmd("normal! ]czz")
       end)
     end
     return
@@ -498,7 +498,7 @@ function M.next_diff()
       vim.api.nvim_win_call(win, function()
         -- Go to top, then first hunk
         vim.cmd("normal! gg")
-        pcall(vim.cmd, "normal! ]c")
+        pcall(vim.cmd, "normal! ]czz")
       end)
     end
   end)
@@ -518,7 +518,7 @@ function M.prev_diff()
     local work_win = diff_review.get_work_win()
     if work_win then
       vim.api.nvim_win_call(work_win, function()
-        vim.cmd("normal! [c")
+        vim.cmd("normal! [czz")
       end)
     end
     return
@@ -548,7 +548,7 @@ function M.prev_diff()
       vim.api.nvim_win_call(win, function()
         -- Go to bottom, then last hunk
         vim.cmd("normal! G")
-        pcall(vim.cmd, "normal! [c")
+        pcall(vim.cmd, "normal! [czz")
       end)
     end
   end)
