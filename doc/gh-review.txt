@@ -76,6 +76,7 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
       close = "q",
       next_comment = "]c",
       prev_comment = "[c",
+      commits = "C",
       next_diff = "]d",
       prev_diff = "[d",
     },
@@ -144,6 +145,7 @@ Normal mode:~
   `<leader>gpo`   Checkout PR (opens fuzzy picker, or prompts if no snacks)
   `<leader>gpO`   Review PR for current branch (no checkout needed)
   `<leader>gpf`   Toggle file tree sidebar
+  `<leader>gpC`   Toggle commits sidebar (select to filter by commit)
   `<leader>gpc`   Toggle comments panel
   `<leader>gpr`   Reply to thread at/near cursor
   `<leader>gpn`   New inline comment thread at cursor
@@ -162,8 +164,10 @@ Normal mode:~
 Buffer-local keymaps:~
 
 Comment thread:   `r` reply, `t` resolve, `o` browser, `q` close
-Trouble panel:    `r` reply, `t` resolve/unresolve, `<cr>` jump to diff
-Description:      `q` close, `o` open PR URL in browser
+Trouble panel:    `r` reply, `t` resolve/unresolve, `v` view thread, `<cr>` jump to diff
+Commits panel:    `<cr>` select/deselect commit, `x` clear commit filter
+Description:      `q` close, `o` browser, `n` new comment, `r` reply
+                  `<cr>` select commit (on commit line), `x` clear commit filter
 Comment input:    `<C-s>` submit, `<Esc><Esc>` cancel
 
 ==============================================================================
@@ -190,6 +194,16 @@ diff highlighting, folds, and scrollbind.
 All comment threads for the file are rendered as virtual lines (extmarks)
 below their respective lines on the right buffer. The focused thread is
 highlighted with `GHReviewInlineFocused` (links to `CurSearch` by default).
+
+Commit Filtering~
+Use `<leader>gpC` to open the commits sidebar listing all PR commits. Press
+`<cr>` to select a commit and filter the review to that commit's changes.
+The file sidebar, comments panel, diagnostics, and diff view all narrow to
+the selected commit. The diff shows the commit's parent on the left and the
+commit version on the right (both readonly). Press `<cr>` again on the same
+commit or `x` to clear the filter and return to the full PR view. You can
+also select commits from the description page (`<leader>gpd`) by pressing
+`<cr>` on a commit line. The lualine component shows the active commit SHA.
 
 Mini.diff (optional)~
 When mini.diff is installed, opening any file that belongs to the active PR

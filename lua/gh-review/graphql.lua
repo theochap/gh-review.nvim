@@ -28,6 +28,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
               body
               createdAt
               url
+              commit { oid }
             }
           }
         }
@@ -54,19 +55,28 @@ local function parse_threads(data)
         url = c.url,
       })
     end
+    -- Get commit OID from the first comment (PR HEAD when comment was placed)
+    local first_node = node.comments.nodes[1]
+    local commit = first_node and type(first_node.commit) == "table" and first_node.commit or nil
+    local commit_oid = commit and commit.oid or nil
+
     table.insert(threads, {
       id = node.id,
       path = node.path,
-      line = node.line,
-      start_line = node.startLine,
+      line = type(node.line) == "number" and node.line or nil,
+      start_line = type(node.startLine) == "number" and node.startLine or nil,
       side = node.diffSide or "RIGHT",
-      is_resolved = node.isResolved,
-      is_outdated = node.isOutdated,
+      is_resolved = node.isResolved == true,
+      is_outdated = node.isOutdated == true,
+      commit_oid = commit_oid,
       comments = comments,
     })
   end
   return threads
 end
+
+-- Exposed for testing
+M._parse_threads = parse_threads
 
 --- Fetch all review threads (handles pagination)
 ---@param owner string

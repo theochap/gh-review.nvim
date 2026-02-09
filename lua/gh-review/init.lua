@@ -74,8 +74,8 @@ end
 ---@param pr_number number
 ---@param callback? fun()
 function M._load_pr_data(pr_number, callback)
-  -- 4 parallel operations: metadata chain, files, diff, comments
-  local pending = 4
+  -- 5 parallel operations: metadata chain, files, diff, comments, commits
+  local pending = 5
   local errors = {}
 
   local function done()
@@ -220,6 +220,30 @@ function M._load_pr_data(pr_number, callback)
     end
     done()
   end)
+
+  -- PR commits
+  gh.pr_commits(pr_number, function(err, commits)
+    if err then
+      table.insert(errors, "commits: " .. err)
+    else
+      local parsed = {}
+      for _, c in ipairs(commits or {}) do
+        local commit = c.commit or c
+        local full_oid = c.oid or commit.oid or ""
+        table.insert(parsed, {
+          sha = full_oid:sub(1, 7),
+          oid = full_oid,
+          message = (commit.messageHeadline or commit.message or ""):match("^([^\n]+)") or "",
+          author = commit.authors and commit.authors[1] and commit.authors[1].login
+            or commit.author and commit.author.login
+            or "unknown",
+          date = commit.committedDate or commit.authoredDate or "",
+        })
+      end
+      state.set_commits(parsed)
+    end
+    done()
+  end)
 end
 
 --- Refresh current PR data
@@ -286,11 +310,26 @@ function M.close()
     local pickers = Snacks.picker.get({ source = "gh_review_files" })
     for _, p in ipairs(pickers) do p:close() end
   end)
+  -- Close commits sidebar if open
+  pcall(function()
+    local Snacks = require("snacks")
+    local pickers = Snacks.picker.get({ source = "gh_review_commits" })
+    for _, p in ipairs(pickers) do p:close() end
+  end)
   -- Close trouble comments panel if open
   pcall(function() require("trouble").close("gh_review") end)
   require("gh-review.integrations.diffview").close()
   state.clear()
   vim.notify("GHReview: review session closed", vim.log.levels.INFO)
+end
+
+--- Toggle commits sidebar
+function M.commits_panel()
+  if not state.is_active() then
+    vim.notify("GHReview: no active review", vim.log.levels.WARN)
+    return
+  end
+  require("gh-review.ui.commits").toggle()
 end
 
 --- Toggle file tree sidebar
@@ -450,7 +489,7 @@ function M._get_current_file_index()
   local file_path = diff_review.get_file_path()
   if not file_path then return nil, nil end
 
-  local files = state.get_files()
+  local files = state.get_effective_files()
   for i, f in ipairs(files) do
     if f.path == file_path then
       return i, files
@@ -752,6 +791,130 @@ function M.checkout_or_pick(pr_number)
   })
 end
 
+--- Select a specific commit for filtered review
+---@param commit GHReviewCommit
+function M.select_commit(commit)
+  if not commit or not commit.oid or commit.oid == "" then
+    vim.notify("GHReview: invalid commit", vim.log.levels.ERROR)
+    return
+  end
+
+  local cwd = vim.fn.getcwd()
+  local status_result = vim.system(
+    { "git", "diff-tree", "--no-commit-id", "--name-status", "-r", "-M", commit.oid },
+    { text = true, cwd = cwd }
+  ):wait()
+
+  if status_result.code ~= 0 then
+    vim.notify("GHReview: git diff-tree failed: " .. (status_result.stderr or ""), vim.log.levels.ERROR)
+    return
+  end
+
+  -- Get line counts via numstat
+  local numstat_result = vim.system(
+    { "git", "diff-tree", "--no-commit-id", "--numstat", "-r", "-M", commit.oid },
+    { text = true, cwd = cwd }
+  ):wait()
+  local stats = {}
+  if numstat_result.code == 0 and numstat_result.stdout then
+    for nline in numstat_result.stdout:gmatch("[^\n]+") do
+      local adds, dels, npath = nline:match("^(%d+)\t(%d+)\t(.+)$")
+      if adds and npath then
+        -- Renames show as "old => new"
+        local new_path = npath:match("=>%s*(.+)$")
+        local key = new_path and vim.trim(new_path) or npath
+        stats[key] = { additions = tonumber(adds), deletions = tonumber(dels) }
+      end
+    end
+  end
+
+  local files = {}
+  for line in (status_result.stdout or ""):gmatch("[^\n]+") do
+    local status_char, path = line:match("^(%S+)\t(.+)$")
+    if status_char and path then
+      local file_status = "modified"
+      local old_path = nil
+      if status_char == "A" then
+        file_status = "added"
+      elseif status_char == "D" then
+        file_status = "deleted"
+      elseif status_char:sub(1, 1) == "R" then
+        file_status = "renamed"
+        local old, new = path:match("^(.+)\t(.+)$")
+        if old and new then
+          old_path = old
+          path = new
+        end
+      end
+      local s = stats[path] or {}
+      table.insert(files, {
+        path = path,
+        status = file_status,
+        additions = s.additions or 0,
+        deletions = s.deletions or 0,
+        old_path = old_path,
+      })
+    end
+  end
+
+  state.set_active_commit(commit)
+  state.set_commit_files(files)
+  M._refresh_views()
+  vim.notify("GHReview: filtering to commit " .. commit.sha, vim.log.levels.INFO)
+end
+
+--- Clear commit filter and restore full PR view
+function M.clear_commit()
+  if not state.get_active_commit() then return end
+  state.clear_active_commit()
+  M._refresh_views()
+  vim.notify("GHReview: showing full PR", vim.log.levels.INFO)
+end
+
+--- Refresh all views after commit selection change
+function M._refresh_views()
+  -- Close diff split
+  require("gh-review.ui.diff_review").close()
+
+  -- Refresh diagnostics
+  diagnostics.refresh_all()
+
+  -- Close and reopen trouble if open
+  local trouble_was_open = false
+  pcall(function()
+    local trouble = require("trouble")
+    if trouble.is_open("gh_review") then
+      trouble_was_open = true
+      trouble.close("gh_review")
+    end
+  end)
+
+  -- Close file sidebar (will reopen below)
+  pcall(function()
+    local Snacks = require("snacks")
+    local pickers = Snacks.picker.get({ source = "gh_review_files" })
+    for _, p in ipairs(pickers) do p:close() end
+  end)
+
+  -- Reopen views with updated data after a short delay
+  vim.defer_fn(function()
+    require("gh-review.ui.files").show()
+    if trouble_was_open then
+      pcall(function()
+        require("trouble").open("gh_review")
+      end)
+    end
+  end, 50)
+
+  -- Refresh description buffer if it exists
+  pcall(function()
+    local buf = vim.fn.bufnr("gh-review://description")
+    if buf ~= -1 and vim.api.nvim_buf_is_valid(buf) then
+      require("gh-review.ui.description").refresh_buf(buf)
+    end
+  end)
+end
+
 --- Get current buffer's path relative to cwd
 ---@return string?
 function M._current_rel_path()
@@ -766,6 +929,7 @@ function M._current_rel_path()
   end
   -- Check if we're in a ghreview:// buffer
   local review_path = filepath:match("^ghreview://base/(.+)$")
+    or filepath:match("^ghreview://commit/[^/]+/(.+)$")
   if review_path then return review_path end
   return filepath
 end
@@ -784,6 +948,7 @@ function M._setup_keymaps()
   map(km.review_current, M.review_current, "Review PR for current branch")
 
   map(km.files, M.files, "Toggle file tree")
+  map(km.commits, M.commits_panel, "Toggle commits panel")
   map(km.comments, M.comments, "Toggle comments panel")
   map(km.reply, M.reply, "Reply to thread")
   map(km.new_thread, M.new_thread, "New comment thread")

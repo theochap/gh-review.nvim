@@ -26,7 +26,16 @@ function M.component()
     status_icon = icons.changes_requested
   end
 
-  return string.format("%s PR #%d %s", icons.branch, pr.number, status_icon)
+  local base = string.format("%s #%d %s %s", icons.branch, pr.number, pr.head_ref or "", status_icon)
+  local active_commit = state.get_active_commit()
+  if active_commit then
+    local msg = active_commit.message or ""
+    if #msg > 30 then
+      msg = msg:sub(1, 27) .. "..."
+    end
+    return base .. " @ " .. active_commit.sha .. " " .. msg
+  end
+  return base
 end
 
 --- Condition function: only show when review is active

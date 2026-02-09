@@ -4,16 +4,29 @@ local M = {}
 local state = require("gh-review.state")
 local config = require("gh-review.config")
 
+--- Set up foreground-only highlight groups for file status
+local function setup_highlights()
+  local links = {
+    GHReviewFileAdded = "Added",
+    GHReviewFileModified = "Changed",
+    GHReviewFileDeleted = "Removed",
+    GHReviewFileRenamed = "Special",
+  }
+  for name, fallback in pairs(links) do
+    vim.api.nvim_set_hl(0, name, { link = fallback, default = true })
+  end
+end
+
 --- Get the display icon/letter for a file status
 ---@param status string
 ---@return string icon, string hl_group
 local function status_display(status)
   local icons = config.get().icons
   local map = {
-    added = { icons.added, "DiffAdd" },
-    modified = { icons.modified, "DiffChange" },
-    deleted = { icons.deleted, "DiffDelete" },
-    renamed = { icons.renamed, "DiffText" },
+    added = { icons.added, "GHReviewFileAdded" },
+    modified = { icons.modified, "GHReviewFileModified" },
+    deleted = { icons.deleted, "GHReviewFileDeleted" },
+    renamed = { icons.renamed, "GHReviewFileRenamed" },
   }
   local entry = map[status] or { "?", "Normal" }
   return entry[1], entry[2]
@@ -138,7 +151,7 @@ end
 
 --- Show the changed files sidebar
 function M.show()
-  local files = state.get_files()
+  local files = state.get_effective_files()
   if #files == 0 then
     vim.notify("No changed files", vim.log.levels.INFO)
     return
@@ -150,13 +163,21 @@ function M.show()
     return
   end
 
+  setup_highlights()
+
   local fmt = require("snacks.picker.format")
   local cwd = vim.fn.getcwd()
   local items = build_items(files, cwd)
 
+  local title = "PR Changed Files"
+  local active_commit = state.get_active_commit()
+  if active_commit then
+    title = title .. " (" .. active_commit.sha .. ")"
+  end
+
   Snacks.picker.pick({
     source = "gh_review_files",
-    title = "PR Changed Files",
+    title = title,
     items = items,
     tree = true,
     layout = { preset = "sidebar", preview = false },
@@ -170,8 +191,8 @@ function M.show()
         local file = item._file_data
         ret[#ret + 1] = { item._icon .. " ", item._hl }
         ret[#ret + 1] = { item._name }
-        ret[#ret + 1] = { "  +" .. (file.additions or 0), "DiffAdd", virtual = true }
-        ret[#ret + 1] = { " -" .. (file.deletions or 0), "DiffDelete", virtual = true }
+        ret[#ret + 1] = { "  +" .. (file.additions or 0), "GHReviewFileAdded", virtual = true }
+        ret[#ret + 1] = { " -" .. (file.deletions or 0), "GHReviewFileDeleted", virtual = true }
       end
       return ret
     end,

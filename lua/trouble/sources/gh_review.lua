@@ -45,6 +45,11 @@ M.config = {
           if not thread then return end
           require("gh-review")._toggle_resolve(thread)
         end,
+        ["v"] = function(self)
+          local thread = M._get_thread(self)
+          if not thread then return end
+          require("gh-review")._show_thread_popup(thread)
+        end,
       },
     },
   },
@@ -59,8 +64,9 @@ function M.get(cb, ctx)
 
   local items = {}
   local cwd = vim.fn.getcwd()
-  for _, thread in ipairs(state.get_threads()) do
-    local line = thread.mapped_line or thread.line or 1
+  for _, thread in ipairs(state.get_effective_threads()) do
+    local raw_line = thread.mapped_line or thread.line
+    local line = type(raw_line) == "number" and raw_line or 1
     local first = thread.comments[1]
     local author = first and first.author or "unknown"
     local body = first and first.body:match("^([^\n]+)") or ""

@@ -50,42 +50,95 @@ function M.open(file_path, target_line)
 	end
 
 	local cwd = vim.fn.getcwd()
-	local base_ref = pr.base_ref
+	local active_commit = state.get_active_commit()
 
-	-- Get base content from git
-	local result = vim.system({ "git", "show", base_ref .. ":" .. file_path }, { text = true, cwd = cwd }):wait()
-	local base_lines = {}
-	if result.code == 0 and result.stdout then
-		base_lines = vim.split(result.stdout, "\n")
-		-- git output ends with \n, producing a trailing empty element
-		if #base_lines > 0 and base_lines[#base_lines] == "" then
-			table.remove(base_lines)
+	if active_commit then
+		local oid = active_commit.oid
+		local short_sha = oid:sub(1, 8)
+
+		-- Right side: commit version of the file
+		local right_result = vim.system({ "git", "show", oid .. ":" .. file_path }, { text = true, cwd = cwd }):wait()
+		local right_lines = {}
+		if right_result.code == 0 and right_result.stdout then
+			right_lines = vim.split(right_result.stdout, "\n")
+			if #right_lines > 0 and right_lines[#right_lines] == "" then
+				table.remove(right_lines)
+			end
 		end
+
+		local work_buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_win_set_buf(0, work_buf)
+		vim.api.nvim_buf_set_lines(work_buf, 0, -1, false, right_lines)
+		vim.api.nvim_buf_set_name(work_buf, "ghreview://commit/" .. short_sha .. "/" .. file_path)
+		vim.bo[work_buf].buftype = "nofile"
+		vim.bo[work_buf].modifiable = false
+		vim.bo[work_buf].bufhidden = "wipe"
+		local ft = vim.filetype.match({ filename = file_path })
+		if ft then
+			vim.bo[work_buf].filetype = ft
+		end
+		current.work_buf = work_buf
+		current.work_win = vim.api.nvim_get_current_win()
+
+		-- Left side: parent commit version of the file
+		local left_result = vim.system({ "git", "show", oid .. "~1:" .. file_path }, { text = true, cwd = cwd }):wait()
+		local left_lines = {}
+		if left_result.code == 0 and left_result.stdout then
+			left_lines = vim.split(left_result.stdout, "\n")
+			if #left_lines > 0 and left_lines[#left_lines] == "" then
+				table.remove(left_lines)
+			end
+		end
+
+		vim.cmd("leftabove vsplit")
+		local base_buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_win_set_buf(0, base_buf)
+		vim.api.nvim_buf_set_lines(base_buf, 0, -1, false, left_lines)
+		vim.api.nvim_buf_set_name(base_buf, "ghreview://base/" .. file_path)
+		vim.bo[base_buf].buftype = "nofile"
+		vim.bo[base_buf].modifiable = false
+		vim.bo[base_buf].bufhidden = "wipe"
+		if ft then
+			vim.bo[base_buf].filetype = ft
+		end
+		current.base_buf = base_buf
+		current.base_win = vim.api.nvim_get_current_win()
+	else
+		local base_ref = pr.base_ref
+
+		-- Get base content from git
+		local result = vim.system({ "git", "show", base_ref .. ":" .. file_path }, { text = true, cwd = cwd }):wait()
+		local base_lines = {}
+		if result.code == 0 and result.stdout then
+			base_lines = vim.split(result.stdout, "\n")
+			if #base_lines > 0 and base_lines[#base_lines] == "" then
+				table.remove(base_lines)
+			end
+		end
+
+		-- Open the working file on the right
+		vim.cmd("edit " .. vim.fn.fnameescape(cwd .. "/" .. file_path))
+		current.work_buf = vim.api.nvim_get_current_buf()
+		current.work_win = vim.api.nvim_get_current_win()
+
+		-- Create base buffer on the left
+		vim.cmd("leftabove vsplit")
+		local base_buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_win_set_buf(0, base_buf)
+		vim.api.nvim_buf_set_lines(base_buf, 0, -1, false, base_lines)
+		vim.api.nvim_buf_set_name(base_buf, "ghreview://base/" .. file_path)
+		vim.bo[base_buf].buftype = "nofile"
+		vim.bo[base_buf].modifiable = false
+		vim.bo[base_buf].bufhidden = "wipe"
+
+		local ft = vim.filetype.match({ filename = file_path })
+		if ft then
+			vim.bo[base_buf].filetype = ft
+		end
+
+		current.base_buf = base_buf
+		current.base_win = vim.api.nvim_get_current_win()
 	end
-
-	-- Open the working file on the right
-	vim.cmd("edit " .. vim.fn.fnameescape(cwd .. "/" .. file_path))
-	current.work_buf = vim.api.nvim_get_current_buf()
-	current.work_win = vim.api.nvim_get_current_win()
-
-	-- Create base buffer on the left
-	vim.cmd("leftabove vsplit")
-	local base_buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_win_set_buf(0, base_buf)
-	vim.api.nvim_buf_set_lines(base_buf, 0, -1, false, base_lines)
-	vim.api.nvim_buf_set_name(base_buf, "ghreview://base/" .. file_path)
-	vim.bo[base_buf].buftype = "nofile"
-	vim.bo[base_buf].modifiable = false
-	vim.bo[base_buf].bufhidden = "wipe"
-
-	-- Try to set filetype based on extension for syntax highlighting
-	local ft = vim.filetype.match({ filename = file_path })
-	if ft then
-		vim.bo[base_buf].filetype = ft
-	end
-
-	current.base_buf = base_buf
-	current.base_win = vim.api.nvim_get_current_win()
 
 	-- Enable diff mode on both windows, disable folding
 	vim.api.nvim_win_call(current.base_win, function()
@@ -107,6 +160,11 @@ function M.open(file_path, target_line)
 	end
 
 	current.file_path = file_path
+
+	-- Set diagnostics on commit diff buffers (BufEnter fires before the name is set)
+	if active_commit and current.work_buf then
+		require("gh-review.ui.diagnostics").refresh_buf(current.work_buf)
+	end
 end
 
 --- Close the diff review split

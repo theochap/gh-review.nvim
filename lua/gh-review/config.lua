@@ -25,6 +25,7 @@ local M = {}
 ---@field review_current string
 ---@field next_comment string
 ---@field prev_comment string
+---@field commits string
 ---@field next_diff string
 ---@field prev_diff string
 
@@ -65,6 +66,7 @@ M.defaults = {
     toggle_overlay = "D",
     open_minidiff = "e",
     review_current = "O",
+    commits = "C",
     next_comment = "]c",
     prev_comment = "[c",
     next_diff = "]d",

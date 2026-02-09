@@ -156,6 +156,117 @@ describe("diagnostics", function()
     end)
   end)
 
+  describe("ghreview:// commit buffers", function()
+    it("sets diagnostics on ghreview://commit/<sha>/<path> buffers", function()
+      state.set_pr({ number = 1, title = "test", base_ref = "main" })
+      state.set_threads({
+        {
+          id = "t1",
+          path = "src/test.lua",
+          line = 5,
+          mapped_line = 7,
+          is_resolved = false,
+          comments = { { author = "alice", body = "Fix this" } },
+        },
+      })
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, "ghreview://commit/abc12345/src/test.lua")
+      vim.bo[buf].buftype = "nofile"
+
+      diagnostics.refresh_buf(buf)
+
+      local diags = vim.diagnostic.get(buf, { namespace = diagnostics.namespace() })
+      assert.are.equal(1, #diags)
+      -- Commit buffers use thread.line (not mapped_line)
+      assert.are.equal(4, diags[1].lnum) -- line 5, 0-indexed = 4
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("uses thread.line not mapped_line for commit diff buffers", function()
+      state.set_pr({ number = 1, title = "test", base_ref = "main" })
+      state.set_threads({
+        {
+          id = "t1",
+          path = "src/test.lua",
+          line = 10,
+          mapped_line = 25,
+          is_resolved = false,
+          comments = { { author = "alice", body = "Commit comment" } },
+        },
+      })
+
+      -- Regular buffer should use mapped_line
+      local reg_buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(reg_buf, vim.fn.getcwd() .. "/src/test.lua")
+      vim.bo[reg_buf].buftype = ""
+      diagnostics.refresh_buf(reg_buf)
+      local reg_diags = vim.diagnostic.get(reg_buf, { namespace = diagnostics.namespace() })
+      assert.are.equal(24, reg_diags[1].lnum) -- mapped_line 25, 0-indexed
+
+      -- Commit buffer should use line
+      local commit_buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(commit_buf, "ghreview://commit/abc12345/src/test.lua")
+      vim.bo[commit_buf].buftype = "nofile"
+      diagnostics.refresh_buf(commit_buf)
+      local commit_diags = vim.diagnostic.get(commit_buf, { namespace = diagnostics.namespace() })
+      assert.are.equal(9, commit_diags[1].lnum) -- line 10, 0-indexed
+
+      vim.api.nvim_buf_delete(reg_buf, { force = true })
+      vim.api.nvim_buf_delete(commit_buf, { force = true })
+    end)
+
+    it("refresh_all includes ghreview://commit buffers", function()
+      state.set_pr({ number = 1, title = "test", base_ref = "main" })
+      state.set_threads({
+        {
+          id = "t1",
+          path = "src/test.lua",
+          line = 5,
+          is_resolved = false,
+          comments = { { author = "alice", body = "Check" } },
+        },
+      })
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, "ghreview://commit/abc12345/src/test.lua")
+      vim.bo[buf].buftype = "nofile"
+
+      diagnostics.refresh_all()
+
+      local diags = vim.diagnostic.get(buf, { namespace = diagnostics.namespace() })
+      assert.are.equal(1, #diags)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("refresh_all skips non-ghreview scratch buffers", function()
+      state.set_pr({ number = 1, title = "test", base_ref = "main" })
+      state.set_threads({
+        {
+          id = "t1",
+          path = "src/test.lua",
+          line = 5,
+          mapped_line = 5,
+          is_resolved = false,
+          comments = { { author = "alice", body = "Skip me" } },
+        },
+      })
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, "some-random-scratch-buffer")
+      vim.bo[buf].buftype = "nofile"
+
+      diagnostics.refresh_all()
+
+      local diags = vim.diagnostic.get(buf, { namespace = diagnostics.namespace() })
+      assert.are.equal(0, #diags)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+  end)
+
   describe("clear_all", function()
     it("removes all diagnostics", function()
       state.set_pr({ number = 1, title = "test", base_ref = "main" })

@@ -16,8 +16,16 @@ local M = {}
 ---@field side string "LEFT" or "RIGHT"
 ---@field is_resolved boolean
 ---@field is_outdated boolean
+---@field commit_oid? string OID of the commit associated with this thread
 ---@field comments GHReviewComment[]
 ---@field mapped_line? number Working tree line number (computed by diff.lua)
+
+---@class GHReviewCommit
+---@field sha string
+---@field oid string
+---@field message string
+---@field author string
+---@field authored_date string
 
 ---@class GHReviewFile
 ---@field path string
@@ -50,6 +58,9 @@ local M = {}
 ---@field pr_comments GHReviewPRComment[] Top-level PR comments (not inline)
 ---@field diff_text string Raw unified diff
 ---@field active boolean
+---@field commits GHReviewCommit[]
+---@field active_commit? GHReviewCommit
+---@field commit_files GHReviewFile[]
 
 ---@type GHReviewState
 local state = {
@@ -59,6 +70,9 @@ local state = {
   pr_comments = {},
   diff_text = "",
   active = false,
+  commits = {},
+  active_commit = nil,
+  commit_files = {},
 }
 
 function M.set_pr(pr)
@@ -83,7 +97,13 @@ function M.set_threads(threads)
 end
 
 function M.get_threads()
-  return state.threads
+  local result = {}
+  for _, thread in ipairs(state.threads) do
+    if not thread.is_outdated then
+      table.insert(result, thread)
+    end
+  end
+  return result
 end
 
 --- Get threads for a specific file path
@@ -92,7 +112,7 @@ end
 function M.get_threads_for_file(path)
   local result = {}
   for _, thread in ipairs(state.threads) do
-    if thread.path == path then
+    if thread.path == path and not thread.is_outdated then
       table.insert(result, thread)
     end
   end
@@ -105,7 +125,7 @@ end
 ---@return GHReviewThread?
 function M.get_thread_at(path, line)
   for _, thread in ipairs(state.threads) do
-    if thread.path == path and thread.mapped_line == line then
+    if thread.path == path and thread.mapped_line == line and not thread.is_outdated then
       return thread
     end
   end
@@ -152,6 +172,94 @@ function M.get_diff_text()
   return state.diff_text
 end
 
+function M.set_commits(commits)
+  state.commits = commits
+end
+
+function M.get_commits()
+  return state.commits
+end
+
+function M.set_active_commit(commit)
+  state.active_commit = commit
+end
+
+function M.get_active_commit()
+  return state.active_commit
+end
+
+function M.clear_active_commit()
+  state.active_commit = nil
+  state.commit_files = {}
+end
+
+function M.set_commit_files(files)
+  state.commit_files = files
+end
+
+function M.get_commit_files()
+  return state.commit_files
+end
+
+--- Get the effective file list: commit files when viewing a commit, PR files otherwise
+---@return GHReviewFile[]
+function M.get_effective_files()
+  if state.active_commit then
+    return state.commit_files
+  end
+  return state.files
+end
+
+--- Get the effective threads: filtered to commit when viewing a commit, all PR threads otherwise
+---@return GHReviewThread[]
+function M.get_effective_threads()
+  if state.active_commit then
+    local commit_paths = {}
+    for _, f in ipairs(state.commit_files) do
+      commit_paths[f.path] = true
+    end
+
+    -- Build set of valid originalCommit OIDs: the selected commit and all
+    -- commits after it in the PR. A comment placed when HEAD was commit N
+    -- could be about any file changed in commits 1..N.
+    local valid_oids = {}
+    local found = false
+    for _, c in ipairs(state.commits) do
+      if c.oid == state.active_commit.oid then
+        found = true
+      end
+      if found then
+        valid_oids[c.oid] = true
+      end
+    end
+
+    local result = {}
+    for _, thread in ipairs(state.threads) do
+      if not thread.is_outdated and commit_paths[thread.path] then
+        if not thread.commit_oid or valid_oids[thread.commit_oid] then
+          table.insert(result, thread)
+        end
+      end
+    end
+    return result
+  end
+  return M.get_threads()
+end
+
+--- Get the effective threads for a specific file path
+---@param path string
+---@return GHReviewThread[]
+function M.get_effective_threads_for_file(path)
+  local threads = M.get_effective_threads()
+  local result = {}
+  for _, thread in ipairs(threads) do
+    if thread.path == path then
+      table.insert(result, thread)
+    end
+  end
+  return result
+end
+
 function M.is_active()
   return state.active
 end
@@ -163,6 +271,9 @@ function M.clear()
   state.pr_comments = {}
   state.diff_text = ""
   state.active = false
+  state.commits = {}
+  state.active_commit = nil
+  state.commit_files = {}
 end
 
 return M

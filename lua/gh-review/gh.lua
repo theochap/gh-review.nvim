@@ -71,24 +71,44 @@ function M.pr_view(pr_number, callback)
   end)
 end
 
---- Get PR changed files
+--- Get PR changed files (via REST API for status info)
 ---@param pr_number number
 ---@param callback fun(err: string?, files: table?)
 function M.pr_files(pr_number, callback)
-  M.run({
-    "pr", "view", tostring(pr_number),
-    "--json", "files",
-  }, function(err, output)
+  -- Use REST API because GraphQL PullRequestChangedFile has no status field
+  M.repo_name(function(err, repo)
     if err then
       callback(err, nil)
       return
     end
-    local ok, data = pcall(vim.json.decode, output)
-    if not ok then
-      callback("Failed to parse files JSON: " .. tostring(data), nil)
-      return
-    end
-    callback(nil, data.files or {})
+    M.run({
+      "api", "repos/" .. repo .. "/pulls/" .. tostring(pr_number) .. "/files",
+      "--paginate",
+    }, function(err2, output)
+      if err2 then
+        callback(err2, nil)
+        return
+      end
+      local ok, data = pcall(vim.json.decode, output)
+      if not ok then
+        callback("Failed to parse files JSON: " .. tostring(data), nil)
+        return
+      end
+      -- Map REST API fields to match expected format
+      local status_map = { removed = "deleted" }
+      local files = {}
+      for _, f in ipairs(data) do
+        local status = f.status or "modified"
+        table.insert(files, {
+          path = f.filename,
+          status = status_map[status] or status,
+          additions = f.additions or 0,
+          deletions = f.deletions or 0,
+          previousFilename = f.previous_filename,
+        })
+      end
+      callback(nil, files)
+    end)
   end)
 end
 
@@ -140,6 +160,40 @@ function M.pr_view_current(callback)
       return
     end
     callback(nil, data)
+  end)
+end
+
+--- Get PR commits
+---@param pr_number number
+---@param callback fun(err: string?, commits: table?)
+function M.pr_commits(pr_number, callback)
+  M.run({
+    "pr", "view", tostring(pr_number),
+    "--json", "commits",
+  }, function(err, output)
+    if err then
+      callback(err, nil)
+      return
+    end
+    local ok, data = pcall(vim.json.decode, output)
+    if not ok then
+      callback("Failed to parse commits JSON: " .. tostring(data), nil)
+      return
+    end
+    callback(nil, data.commits or {})
+  end)
+end
+
+--- Add a top-level comment to a PR
+---@param pr_number number
+---@param body string
+---@param callback fun(err: string?)
+function M.pr_add_comment(pr_number, body, callback)
+  M.run({
+    "pr", "comment", tostring(pr_number),
+    "--body", body,
+  }, function(err, _)
+    callback(err)
   end)
 end
 

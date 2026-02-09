@@ -43,6 +43,28 @@ describe("state", function()
     end)
   end)
 
+  describe("get_threads", function()
+    it("excludes outdated threads", function()
+      state.set_threads({
+        { id = "t1", path = "a.lua", mapped_line = 1, is_outdated = false },
+        { id = "t2", path = "a.lua", mapped_line = 2, is_outdated = true },
+        { id = "t3", path = "b.lua", mapped_line = 3, is_outdated = false },
+      })
+
+      local result = state.get_threads()
+      assert.are.equal(2, #result)
+      assert.are.equal("t1", result[1].id)
+      assert.are.equal("t3", result[2].id)
+    end)
+
+    it("returns empty when all threads are outdated", function()
+      state.set_threads({
+        { id = "t1", path = "a.lua", mapped_line = 1, is_outdated = true },
+      })
+      assert.are.same({}, state.get_threads())
+    end)
+  end)
+
   describe("get_threads_for_file", function()
     it("returns only threads matching the path", function()
       state.set_threads({
@@ -62,6 +84,16 @@ describe("state", function()
         { id = "t1", path = "a.lua", mapped_line = 1 },
       })
       assert.are.same({}, state.get_threads_for_file("nope.lua"))
+    end)
+
+    it("excludes outdated threads", function()
+      state.set_threads({
+        { id = "t1", path = "a.lua", mapped_line = 1, is_outdated = false },
+        { id = "t2", path = "a.lua", mapped_line = 2, is_outdated = true },
+      })
+      local result = state.get_threads_for_file("a.lua")
+      assert.are.equal(1, #result)
+      assert.are.equal("t1", result[1].id)
     end)
   end)
 
@@ -88,6 +120,13 @@ describe("state", function()
         { id = "t1", path = "a.lua", mapped_line = 10 },
       })
       assert.is_nil(state.get_thread_at("b.lua", 10))
+    end)
+
+    it("skips outdated threads even at exact match", function()
+      state.set_threads({
+        { id = "t1", path = "a.lua", mapped_line = 10, is_outdated = true },
+      })
+      assert.is_nil(state.get_thread_at("a.lua", 10))
     end)
   end)
 
@@ -128,6 +167,15 @@ describe("state", function()
 
     it("returns nil for wrong file", function()
       assert.is_nil(state.get_nearest_thread("nope.lua", 10))
+    end)
+
+    it("skips outdated threads in proximity search", function()
+      state.set_threads({
+        { id = "t1", path = "a.lua", mapped_line = 10, is_outdated = true },
+        { id = "t2", path = "a.lua", mapped_line = 20 },
+      })
+      -- Line 11 is close to t1 but t1 is outdated; should not find it
+      assert.is_nil(state.get_nearest_thread("a.lua", 11))
     end)
   end)
 end)

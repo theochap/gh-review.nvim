@@ -3,6 +3,7 @@ local M = {}
 
 local state = require("gh-review.state")
 local config = require("gh-review.config")
+local gh = require("gh-review.gh")
 
 --- Format a timestamp for display
 ---@param ts string ISO 8601 timestamp
@@ -39,6 +40,16 @@ local function build_lines()
   table.insert(lines, "URL: " .. pr.url)
   table.insert(lines, "")
 
+  -- Stats
+  local files = state.get_files()
+  local total_add, total_del = 0, 0
+  for _, f in ipairs(files) do
+    total_add = total_add + (f.additions or 0)
+    total_del = total_del + (f.deletions or 0)
+  end
+  table.insert(lines, #files .. " files changed, +" .. total_add .. " -" .. total_del)
+  table.insert(lines, "")
+
   -- Description
   table.insert(lines, "## Description")
   table.insert(lines, "")
@@ -48,6 +59,22 @@ local function build_lines()
   else
     for line in body:gmatch("[^\n]*") do
       table.insert(lines, line)
+    end
+  end
+  table.insert(lines, "")
+
+  -- Commits
+  local commits = state.get_commits()
+  table.insert(lines, "## Commits (" .. #commits .. ")")
+  table.insert(lines, "")
+  if #commits == 0 then
+    table.insert(lines, "(no commits)")
+  else
+    local active_commit = state.get_active_commit()
+    for _, c in ipairs(commits) do
+      local date = format_time(c.date or "")
+      local prefix = (active_commit and active_commit.oid == c.oid) and "> " or "  "
+      table.insert(lines, prefix .. "`" .. c.sha .. "` " .. c.message .. " — @" .. c.author .. " " .. date)
     end
   end
   table.insert(lines, "")
@@ -139,7 +166,100 @@ function M.show()
     end
   end, kopts)
 
+  -- New top-level comment
+  vim.keymap.set("n", "n", function()
+    require("gh-review.ui.comment_input").open({
+      title = "New Comment on PR #" .. pr.number,
+      on_submit = function(body)
+        vim.notify("GHReview: posting comment...", vim.log.levels.INFO)
+        gh.pr_add_comment(pr.number, body, function(err)
+          if err then
+            vim.notify("GHReview: comment failed: " .. err, vim.log.levels.ERROR)
+          else
+            vim.notify("GHReview: comment posted", vim.log.levels.INFO)
+            require("gh-review").refresh(function()
+              M.refresh_buf(buf)
+            end)
+          end
+        end)
+      end,
+    })
+  end, kopts)
+
+  -- Reply to a comment (cursor must be on/near a comment)
+  vim.keymap.set("n", "r", function()
+    local comments = state.get_pr_comments()
+    if #comments == 0 then
+      vim.notify("GHReview: no comments to reply to", vim.log.levels.INFO)
+      return
+    end
+    -- Use the last comment as context for a reply
+    local last = comments[#comments]
+    local preview = last.body:match("^([^\n]+)") or ""
+    if #preview > 50 then preview = preview:sub(1, 47) .. "..." end
+
+    local context_lines = {}
+    for _, comment in ipairs(comments) do
+      table.insert(context_lines, "@" .. comment.author .. ":")
+      for body_line in comment.body:gmatch("[^\n]*") do
+        table.insert(context_lines, "  " .. body_line)
+      end
+      table.insert(context_lines, "")
+    end
+
+    require("gh-review.ui.comment_input").open({
+      title = "Reply: " .. preview,
+      context_lines = context_lines,
+      on_submit = function(body)
+        vim.notify("GHReview: posting reply...", vim.log.levels.INFO)
+        gh.pr_add_comment(pr.number, body, function(err)
+          if err then
+            vim.notify("GHReview: reply failed: " .. err, vim.log.levels.ERROR)
+          else
+            vim.notify("GHReview: reply posted", vim.log.levels.INFO)
+            require("gh-review").refresh(function()
+              M.refresh_buf(buf)
+            end)
+          end
+        end)
+      end,
+    })
+  end, kopts)
+
+  -- Select commit for filtered review
+  vim.keymap.set("n", "<cr>", function()
+    local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+    local line_text = vim.api.nvim_buf_get_lines(buf, cursor_line - 1, cursor_line, false)[1] or ""
+    local sha = line_text:match("`(%x+)`")
+    if not sha then return end
+
+    local commits = state.get_commits()
+    for _, c in ipairs(commits) do
+      if c.sha == sha then
+        require("gh-review").select_commit(c)
+        M.refresh_buf(buf)
+        return
+      end
+    end
+  end, kopts)
+
+  -- Clear commit filter
+  vim.keymap.set("n", "x", function()
+    require("gh-review").clear_commit()
+    M.refresh_buf(buf)
+  end, kopts)
+
   return win, buf
+end
+
+--- Refresh the description buffer content (if it exists)
+---@param buf number
+function M.refresh_buf(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  local lines = build_lines()
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
 end
 
 return M

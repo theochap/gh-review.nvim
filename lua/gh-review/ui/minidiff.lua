@@ -21,18 +21,23 @@ function M.attach(buf)
   local cwd = vim.fn.getcwd()
   local rel = filepath:sub(#cwd + 2)
 
-  -- Only attach to files that are part of the PR
+  -- Only attach to files that are part of the effective file set
   local found = false
-  for _, f in ipairs(state.get_files()) do
+  for _, f in ipairs(state.get_effective_files()) do
     if f.path == rel then found = true; break end
   end
   if not found then return end
 
+  -- Determine base ref: commit parent or PR base
+  local active_commit = state.get_active_commit()
+  local base_ref = active_commit and (active_commit.oid .. "~1") or pr.base_ref
+  local cache_key = base_ref .. ":" .. rel
+
   -- Get base content (cached per buffer)
   local cached = ref_cache[buf]
-  if not cached or cached.path ~= rel then
+  if not cached or cached.path ~= cache_key then
     local result = vim.system(
-      { "git", "show", pr.base_ref .. ":" .. rel },
+      { "git", "show", base_ref .. ":" .. rel },
       { text = true, cwd = cwd }
     ):wait()
     if result.code ~= 0 then return end
@@ -40,7 +45,7 @@ function M.attach(buf)
     if #lines > 0 and lines[#lines] == "" then
       table.remove(lines)
     end
-    ref_cache[buf] = { path = rel, lines = lines }
+    ref_cache[buf] = { path = cache_key, lines = lines }
   end
 
   -- Override source to a no-op so the git source doesn't run and
