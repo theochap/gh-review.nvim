@@ -60,12 +60,12 @@ function M.show()
     format = function(item)
       local c = item._commit
       local prefix = item._is_active and "> " or "  "
-      local prefix_hl = item._is_active and "CurSearch" or "Normal"
+      local prefix_hl = item._is_active and "CurSearch" or "SnacksPickerIdx"
       local date = format_time(c.date or "")
       return {
         { prefix, prefix_hl },
         { c.sha, "Identifier" },
-        { " " .. c.message, "Normal" },
+        { " " .. c.message },
         { "  @" .. c.author .. " " .. date, "Comment", virtual = true },
       }
     end,
