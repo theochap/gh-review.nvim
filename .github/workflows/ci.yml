@@ -17,22 +17,29 @@ jobs:
           neovim: true
           version: stable
 
+      - name: Install luarocks and coverage tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luarocks
+          sudo luarocks install luacov
+          sudo luarocks install luacov-console
+
       - name: Run tests
         run: make test
-
-      - name: Install coverage dependencies
-        run: make deps-coverage
 
       - name: Run tests with coverage
         run: |
           make coverage-clean
           nvim -l tests/minit_coverage.lua --busted tests/ -o utfTerminal
-          make coverage-report
+          sed "s|$(pwd)/||g" luacov.stats.out > luacov.stats.out.tmp && mv luacov.stats.out.tmp luacov.stats.out
+          luacov
+          luacov-console
+          luacov-console --summary
 
       - name: Extract coverage percentage
         id: coverage
         run: |
-          COVERAGE=$(.tests/data/nvim/lazy-rocks/hererocks/bin/luacov-console --summary | sed 's/\x1b\[[0-9;]*m//g' | grep '^Total' | awk '{print $NF}' | tr -d '%')
+          COVERAGE=$(luacov-console --summary | sed 's/\x1b\[[0-9;]*m//g' | grep '^Total' | awk '{print $NF}' | tr -d '%')
           echo "percentage=$COVERAGE" >> "$GITHUB_OUTPUT"
           echo "Coverage: ${COVERAGE}%"
 
