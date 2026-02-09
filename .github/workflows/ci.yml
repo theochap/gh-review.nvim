@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+
+      - name: Run tests
+        run: make test
+
+      - name: Install coverage dependencies
+        run: make deps-coverage
+
+      - name: Run tests with coverage
+        run: |
+          make coverage-clean
+          nvim -l tests/minit_coverage.lua --busted tests/ -o utfTerminal
+          make coverage-report
+
+      - name: Extract coverage percentage
+        id: coverage
+        run: |
+          COVERAGE=$(.tests/data/nvim/lazy-rocks/hererocks/bin/luacov-console --summary | sed 's/\x1b\[[0-9;]*m//g' | grep '^Total' | awk '{print $NF}' | tr -d '%')
+          echo "percentage=$COVERAGE" >> "$GITHUB_OUTPUT"
+          echo "Coverage: ${COVERAGE}%"
+
+      - name: Generate coverage badge
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          COVERAGE: ${{ steps.coverage.outputs.percentage }}
+        run: |
+          if [ -z "$COVERAGE" ]; then
+            echo "No coverage percentage found, skipping badge"
+            exit 0
+          fi
+          if [ "$(echo "$COVERAGE >= 90" | bc)" -eq 1 ]; then
+            COLOR="brightgreen"
+          elif [ "$(echo "$COVERAGE >= 80" | bc)" -eq 1 ]; then
+            COLOR="green"
+          elif [ "$(echo "$COVERAGE >= 70" | bc)" -eq 1 ]; then
+            COLOR="yellowgreen"
+          elif [ "$(echo "$COVERAGE >= 60" | bc)" -eq 1 ]; then
+            COLOR="yellow"
+          else
+            COLOR="red"
+          fi
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$COVERAGE" "$COLOR" > badge/coverage.json
+
+      - name: Push coverage badge
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          if [ ! -f badge/coverage.json ]; then exit 0; fi
+          cd badge
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b coverage-badge
+          git add coverage.json
+          git commit -m "Update coverage badge"
+          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" coverage-badge
