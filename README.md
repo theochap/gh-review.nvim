@@ -7,6 +7,21 @@ Review GitHub Pull Requests without leaving Neovim.
 
 Checkout a PR, browse changed files, navigate inline comment threads, reply, resolve, and create new threads — all from your editor. Filter your review to a single commit, navigate diff hunks across files, and get notified when your current branch has an open PR.
 
+## Disclaimer
+
+This plugin has been mostly generated using AI, I did that for a few reasons:
+
+- I wanted to figure out how good AI was at writing lua (happens the answer is: pretty good)
+- I felt that all the existing gh plugins that were missing features for my PR review workflows but I wasn't annoyed enough to dedicate hours on fixing that issue by myself.
+- This is not critical enough to dedicate time handwriting the best implementation. A vibe-coded plugin mostly works for everyday use.
+
+That being said, I spent some time reading, refactoring and adding tests to limit the amount of slop that is generated. Overall I am pretty satisfied with the result.
+
+A few notes:
+
+- It may not work. If you notice a bug, please open an issue AND try to fix it. Unless this is annoying to me too, I won't dedicate time to fix it
+- I am not thinking of adding much more to what's already there.
+
 ## Requirements
 
 - Neovim >= 0.10
@@ -66,6 +81,7 @@ notifies you with a hint to press `<leader>gpO`.
 | `]d` / `[d` | | Next/previous diff hunk (cross-file) |
 
 **Buffer-local keymaps:**
+
 - Comment thread: `r` reply, `t` resolve, `o` browser, `q` close
 - Trouble panel: `r` reply, `t` resolve, `v` view thread, `<cr>` jump to diff
 - Commits panel: `<cr>` select/deselect commit, `x` clear filter
