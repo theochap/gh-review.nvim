@@ -190,7 +190,12 @@ function M.show()
       else
         local file = item._file_data
         ret[#ret + 1] = { item._icon .. " ", item._hl }
-        ret[#ret + 1] = { item._name }
+        if file.status == "renamed" and file.old_path then
+          local old_name = file.old_path:match("[^/]+$") or file.old_path
+          ret[#ret + 1] = { old_name .. " → " .. item._name, item._hl }
+        else
+          ret[#ret + 1] = { item._name }
+        end
         ret[#ret + 1] = { "  +" .. (file.additions or 0), "GHReviewFileAdded", virtual = true }
         ret[#ret + 1] = { " -" .. (file.deletions or 0), "GHReviewFileDeleted", virtual = true }
       end

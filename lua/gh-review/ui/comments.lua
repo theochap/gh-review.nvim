@@ -80,7 +80,8 @@ function M.show_thread(thread, opts)
     title_pos = "center",
   })
 
-  -- Enable word wrap at word boundaries
+  -- Use proper floating window highlights and enable word wrap
+  vim.wo[win].winhighlight = "Normal:NormalFloat,CursorLine:CursorLine"
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
 
