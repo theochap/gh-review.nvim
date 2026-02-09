@@ -7,6 +7,27 @@ local gh = require("gh-review.gh")
 local graphql = require("gh-review.graphql")
 local diff = require("gh-review.diff")
 local diagnostics = require("gh-review.ui.diagnostics")
+local util = require("gh-review.util")
+
+--- Guard: return true (and notify) if no active review
+---@return boolean
+local function require_active()
+  if not state.is_active() then
+    vim.notify("GHReview: no active review", vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
+--- Close all snacks pickers for a given source
+---@param source string
+local function close_snacks_picker(source)
+  pcall(function()
+    local Snacks = require("snacks")
+    local pickers = Snacks.picker.get({ source = source })
+    for _, p in ipairs(pickers) do p:close() end
+  end)
+end
 
 --- Plugin setup
 ---@param user_config? table
@@ -261,10 +282,7 @@ end
 
 --- Open current diff file in a normal buffer with mini.diff overlay
 function M.open_minidiff()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
 
   local diff_review = require("gh-review.ui.diff_review")
   local file_path = diff_review.get_file_path()
@@ -292,10 +310,7 @@ end
 
 --- Toggle mini.diff overlay on current buffer
 function M.toggle_overlay()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
   require("gh-review.ui.minidiff").toggle_overlay()
 end
 
@@ -304,18 +319,8 @@ function M.close()
   require("gh-review.ui.minidiff").detach_all()
   diagnostics.clear_all()
   require("gh-review.ui.diff_review").close()
-  -- Close file sidebar if open
-  pcall(function()
-    local Snacks = require("snacks")
-    local pickers = Snacks.picker.get({ source = "gh_review_files" })
-    for _, p in ipairs(pickers) do p:close() end
-  end)
-  -- Close commits sidebar if open
-  pcall(function()
-    local Snacks = require("snacks")
-    local pickers = Snacks.picker.get({ source = "gh_review_commits" })
-    for _, p in ipairs(pickers) do p:close() end
-  end)
+  close_snacks_picker("gh_review_files")
+  close_snacks_picker("gh_review_commits")
   -- Close trouble comments panel if open
   pcall(function() require("trouble").close("gh_review") end)
   require("gh-review.integrations.diffview").close()
@@ -325,28 +330,19 @@ end
 
 --- Toggle commits sidebar
 function M.commits_panel()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
   require("gh-review.ui.commits").toggle()
 end
 
 --- Toggle file tree sidebar
 function M.files()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
   require("gh-review.ui.files").toggle()
 end
 
 --- Toggle comments panel (open / focus / close cycle)
 function M.comments()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
   local trouble = require("trouble")
   if trouble.is_open("gh_review") then
     if vim.bo.filetype == "trouble" then
@@ -361,10 +357,7 @@ end
 
 --- Show comment thread at or near cursor
 function M.show_hover()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
 
   local rel_path = M._current_rel_path()
   if not rel_path then return end
@@ -380,10 +373,7 @@ end
 
 --- Show PR description page
 function M.description()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
   require("gh-review.ui.description").show()
 end
 
@@ -412,11 +402,13 @@ function M._goto_thread(thread)
   end)
 end
 
---- Jump to next comment in current file
-function M.next_comment()
+--- Navigate to next or previous comment in current file
+---@param forward boolean true for next, false for previous
+local function navigate_comment(forward)
+  local fallback = forward and "]c" or "[c"
+
   if not state.is_active() then
-    -- Fall through to default ]c (e.g., gitsigns)
-    vim.cmd("normal! ]c")
+    vim.cmd("normal! " .. fallback)
     return
   end
 
@@ -425,20 +417,28 @@ function M.next_comment()
 
   local threads = state.get_threads_for_file(rel_path)
   if #threads == 0 then
-    vim.cmd("normal! ]c")
+    vim.cmd("normal! " .. fallback)
     return
   end
 
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  -- Sort by mapped_line
   table.sort(threads, function(a, b)
-    return (a.mapped_line or 0) < (b.mapped_line or 0)
+    if forward then
+      return (a.mapped_line or 0) < (b.mapped_line or 0)
+    else
+      return (a.mapped_line or 0) > (b.mapped_line or 0)
+    end
   end)
 
   for _, thread in ipairs(threads) do
-    if thread.mapped_line and thread.mapped_line > cursor_line then
-      M._goto_thread(thread)
-      return
+    if thread.mapped_line then
+      if forward and thread.mapped_line > cursor_line then
+        M._goto_thread(thread)
+        return
+      elseif not forward and thread.mapped_line < cursor_line then
+        M._goto_thread(thread)
+        return
+      end
     end
   end
 
@@ -448,38 +448,14 @@ function M.next_comment()
   end
 end
 
+--- Jump to next comment in current file
+function M.next_comment()
+  navigate_comment(true)
+end
+
 --- Jump to previous comment in current file
 function M.prev_comment()
-  if not state.is_active() then
-    vim.cmd("normal! [c")
-    return
-  end
-
-  local rel_path = M._current_rel_path()
-  if not rel_path then return end
-
-  local threads = state.get_threads_for_file(rel_path)
-  if #threads == 0 then
-    vim.cmd("normal! [c")
-    return
-  end
-
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  table.sort(threads, function(a, b)
-    return (a.mapped_line or 0) > (b.mapped_line or 0)
-  end)
-
-  for _, thread in ipairs(threads) do
-    if thread.mapped_line and thread.mapped_line < cursor_line then
-      M._goto_thread(thread)
-      return
-    end
-  end
-
-  -- Wrap around
-  if threads[1] and threads[1].mapped_line then
-    M._goto_thread(threads[1])
-  end
+  navigate_comment(false)
 end
 
 --- Find the index of the currently open diff file in state.get_files()
@@ -525,113 +501,85 @@ function M._at_boundary_hunk(direction)
   return at_boundary
 end
 
---- Jump to next diff hunk, crossing file boundaries
-function M.next_diff()
+--- Navigate to next or previous diff hunk, crossing file boundaries
+---@param forward boolean true for next, false for previous
+local function navigate_diff(forward)
   local diff_review = require("gh-review.ui.diff_review")
+  local motion = forward and "]c" or "[c"
+  local boundary_dir = forward and "next" or "prev"
 
   if not state.is_active() or not diff_review.is_diff_active() then
-    -- Fall through to native ]c
-    pcall(vim.cmd, "normal! ]c")
+    pcall(vim.cmd, "normal! " .. motion)
     return
   end
 
-  if not M._at_boundary_hunk("next") then
+  if not M._at_boundary_hunk(boundary_dir) then
     -- Still have hunks in this file — just do the motion
     local work_win = diff_review.get_work_win()
     if work_win then
       vim.api.nvim_win_call(work_win, function()
-        vim.cmd("normal! ]czz")
+        vim.cmd("normal! " .. motion .. "zz")
       end)
     end
     return
   end
 
-  -- At boundary — find next non-deleted file
+  -- At boundary — find adjacent non-deleted file
   local idx, files = M._get_current_file_index()
   if not idx or not files then return end
 
-  local next_idx = nil
-  for i = idx + 1, #files do
-    if files[i].status ~= "deleted" then
-      next_idx = i
-      break
+  local adj_idx = nil
+  if forward then
+    for i = idx + 1, #files do
+      if files[i].status ~= "deleted" then
+        adj_idx = i
+        break
+      end
+    end
+  else
+    for i = idx - 1, 1, -1 do
+      if files[i].status ~= "deleted" then
+        adj_idx = i
+        break
+      end
     end
   end
 
-  if not next_idx then
-    vim.notify("GHReview: last file in PR", vim.log.levels.INFO)
+  if not adj_idx then
+    vim.notify("GHReview: " .. (forward and "last" or "first") .. " file in PR", vim.log.levels.INFO)
     return
   end
 
-  diff_review.open(files[next_idx].path)
+  diff_review.open(files[adj_idx].path)
   vim.schedule(function()
     local win = diff_review.get_work_win()
     if win then
       vim.api.nvim_win_call(win, function()
-        -- Go to top, then first hunk
-        vim.cmd("normal! gg")
-        pcall(vim.cmd, "normal! ]czz")
+        if forward then
+          vim.cmd("normal! gg")
+          pcall(vim.cmd, "normal! ]czz")
+        else
+          vim.cmd("normal! G")
+          pcall(vim.cmd, "normal! [czz")
+        end
       end)
     end
   end)
+end
+
+--- Jump to next diff hunk, crossing file boundaries
+function M.next_diff()
+  navigate_diff(true)
 end
 
 --- Jump to previous diff hunk, crossing file boundaries
 function M.prev_diff()
-  local diff_review = require("gh-review.ui.diff_review")
-
-  if not state.is_active() or not diff_review.is_diff_active() then
-    -- Fall through to native [c
-    pcall(vim.cmd, "normal! [c")
-    return
-  end
-
-  if not M._at_boundary_hunk("prev") then
-    local work_win = diff_review.get_work_win()
-    if work_win then
-      vim.api.nvim_win_call(work_win, function()
-        vim.cmd("normal! [czz")
-      end)
-    end
-    return
-  end
-
-  -- At boundary — find previous non-deleted file
-  local idx, files = M._get_current_file_index()
-  if not idx or not files then return end
-
-  local prev_idx = nil
-  for i = idx - 1, 1, -1 do
-    if files[i].status ~= "deleted" then
-      prev_idx = i
-      break
-    end
-  end
-
-  if not prev_idx then
-    vim.notify("GHReview: first file in PR", vim.log.levels.INFO)
-    return
-  end
-
-  diff_review.open(files[prev_idx].path)
-  vim.schedule(function()
-    local win = diff_review.get_work_win()
-    if win then
-      vim.api.nvim_win_call(win, function()
-        -- Go to bottom, then last hunk
-        vim.cmd("normal! G")
-        pcall(vim.cmd, "normal! [czz")
-      end)
-    end
-  end)
+  navigate_diff(false)
 end
 
 --- Reply to the thread at cursor position
 function M.reply()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
 
   local rel_path = M._current_rel_path()
   local thread = state.get_nearest_thread(rel_path, vim.api.nvim_win_get_cursor(0)[1], math.huge)
@@ -646,10 +594,7 @@ end
 
 --- Start a new inline comment thread at cursor
 function M.new_thread()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
 
   local pr = state.get_pr()
   if not pr or not pr.node_id then
@@ -683,10 +628,7 @@ end
 
 --- Toggle resolve/unresolve on the nearest thread
 function M.resolve()
-  if not state.is_active() then
-    vim.notify("GHReview: no active review", vim.log.levels.WARN)
-    return
-  end
+  if not require_active() then return end
 
   local rel_path = M._current_rel_path()
   local thread = state.get_nearest_thread(rel_path, vim.api.nvim_win_get_cursor(0)[1], math.huge)
@@ -712,17 +654,7 @@ function M._reply_to_thread(thread)
   local preview = first and first.body:match("^([^\n]+)") or ""
   if #preview > 50 then preview = preview:sub(1, 47) .. "..." end
 
-  -- Build context showing the full thread being replied to
-  local context_lines = {}
-  for i, comment in ipairs(thread.comments) do
-    table.insert(context_lines, "@" .. comment.author .. ":")
-    for body_line in comment.body:gmatch("[^\n]*") do
-      table.insert(context_lines, "  " .. body_line)
-    end
-    if i < #thread.comments then
-      table.insert(context_lines, "")
-    end
-  end
+  local context_lines = util.build_thread_context(thread.comments)
 
   require("gh-review.ui.comment_input").open({
     title = "Reply: " .. preview,
@@ -890,11 +822,7 @@ function M._refresh_views()
   end)
 
   -- Close file sidebar (will reopen below)
-  pcall(function()
-    local Snacks = require("snacks")
-    local pickers = Snacks.picker.get({ source = "gh_review_files" })
-    for _, p in ipairs(pickers) do p:close() end
-  end)
+  close_snacks_picker("gh_review_files")
 
   -- Reopen views with updated data after a short delay
   vim.defer_fn(function()

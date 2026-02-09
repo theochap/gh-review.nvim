@@ -2,15 +2,7 @@
 local M = {}
 
 local config = require("gh-review.config")
-
---- Format a timestamp for display
----@param ts string ISO 8601 timestamp
----@return string
-local function format_time(ts)
-  -- Extract date portion
-  local date = ts:match("^(%d%d%d%d%-%d%d%-%d%d)")
-  return date or ts
-end
+local util = require("gh-review.util")
 
 --- Show a single thread in a floating window
 ---@param thread table GHReviewThread
@@ -29,7 +21,7 @@ function M.show_thread(thread, opts)
 
   -- Comments
   for i, comment in ipairs(thread.comments) do
-    local header = "@" .. comment.author .. "  " .. format_time(comment.created_at)
+    local header = "@" .. comment.author .. "  " .. util.format_time(comment.created_at)
     table.insert(lines, header)
     table.insert(highlights, { line = #lines, hl = "Special" })
 

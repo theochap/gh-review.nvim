@@ -2,6 +2,7 @@
 local M = {}
 
 local state = require("gh-review.state")
+local util = require("gh-review.util")
 
 ---@class GHDiffReviewState
 ---@field file_path? string
@@ -23,6 +24,27 @@ end
 ---@return boolean
 local function buf_valid(buf)
 	return buf ~= nil and vim.api.nvim_buf_is_valid(buf)
+end
+
+--- Enable diff mode on both windows, disable folding, position cursor
+---@param target_line? number
+local function setup_diff_windows(target_line)
+	vim.api.nvim_win_call(current.base_win, function()
+		vim.cmd("diffthis")
+		vim.wo[0].foldenable = false
+	end)
+	vim.api.nvim_win_call(current.work_win, function()
+		vim.cmd("diffthis")
+		vim.wo[0].foldenable = false
+	end)
+
+	vim.api.nvim_set_current_win(current.work_win)
+	if target_line then
+		local line_count = vim.api.nvim_buf_line_count(current.work_buf)
+		local target = math.min(target_line, line_count)
+		vim.api.nvim_win_set_cursor(current.work_win, { target, 0 })
+		vim.cmd("normal! zz")
+	end
 end
 
 --- Open native diff split for a file
@@ -57,64 +79,24 @@ function M.open(file_path, target_line)
 		local short_sha = oid:sub(1, 8)
 
 		-- Right side: commit version of the file
-		local right_result = vim.system({ "git", "show", oid .. ":" .. file_path }, { text = true, cwd = cwd }):wait()
-		local right_lines = {}
-		if right_result.code == 0 and right_result.stdout then
-			right_lines = vim.split(right_result.stdout, "\n")
-			if #right_lines > 0 and right_lines[#right_lines] == "" then
-				table.remove(right_lines)
-			end
-		end
-
-		local work_buf = vim.api.nvim_create_buf(false, true)
+		local right_lines = util.git_show_lines(oid .. ":" .. file_path, cwd)
+		local work_buf = util.create_scratch_buf("ghreview://commit/" .. short_sha .. "/" .. file_path, right_lines, file_path)
 		vim.api.nvim_win_set_buf(0, work_buf)
-		vim.api.nvim_buf_set_lines(work_buf, 0, -1, false, right_lines)
-		vim.api.nvim_buf_set_name(work_buf, "ghreview://commit/" .. short_sha .. "/" .. file_path)
-		vim.bo[work_buf].buftype = "nofile"
-		vim.bo[work_buf].modifiable = false
-		vim.bo[work_buf].bufhidden = "wipe"
-		local ft = vim.filetype.match({ filename = file_path })
-		if ft then
-			vim.bo[work_buf].filetype = ft
-		end
 		current.work_buf = work_buf
 		current.work_win = vim.api.nvim_get_current_win()
 
 		-- Left side: parent commit version of the file
-		local left_result = vim.system({ "git", "show", oid .. "~1:" .. file_path }, { text = true, cwd = cwd }):wait()
-		local left_lines = {}
-		if left_result.code == 0 and left_result.stdout then
-			left_lines = vim.split(left_result.stdout, "\n")
-			if #left_lines > 0 and left_lines[#left_lines] == "" then
-				table.remove(left_lines)
-			end
-		end
-
+		local left_lines = util.git_show_lines(oid .. "~1:" .. file_path, cwd)
 		vim.cmd("leftabove vsplit")
-		local base_buf = vim.api.nvim_create_buf(false, true)
+		local base_buf = util.create_scratch_buf("ghreview://base/" .. file_path, left_lines, file_path)
 		vim.api.nvim_win_set_buf(0, base_buf)
-		vim.api.nvim_buf_set_lines(base_buf, 0, -1, false, left_lines)
-		vim.api.nvim_buf_set_name(base_buf, "ghreview://base/" .. file_path)
-		vim.bo[base_buf].buftype = "nofile"
-		vim.bo[base_buf].modifiable = false
-		vim.bo[base_buf].bufhidden = "wipe"
-		if ft then
-			vim.bo[base_buf].filetype = ft
-		end
 		current.base_buf = base_buf
 		current.base_win = vim.api.nvim_get_current_win()
 	else
 		local base_ref = pr.base_ref
 
 		-- Get base content from git
-		local result = vim.system({ "git", "show", base_ref .. ":" .. file_path }, { text = true, cwd = cwd }):wait()
-		local base_lines = {}
-		if result.code == 0 and result.stdout then
-			base_lines = vim.split(result.stdout, "\n")
-			if #base_lines > 0 and base_lines[#base_lines] == "" then
-				table.remove(base_lines)
-			end
-		end
+		local base_lines = util.git_show_lines(base_ref .. ":" .. file_path, cwd)
 
 		-- Open the working file on the right
 		vim.cmd("edit " .. vim.fn.fnameescape(cwd .. "/" .. file_path))
@@ -123,42 +105,13 @@ function M.open(file_path, target_line)
 
 		-- Create base buffer on the left
 		vim.cmd("leftabove vsplit")
-		local base_buf = vim.api.nvim_create_buf(false, true)
+		local base_buf = util.create_scratch_buf("ghreview://base/" .. file_path, base_lines, file_path)
 		vim.api.nvim_win_set_buf(0, base_buf)
-		vim.api.nvim_buf_set_lines(base_buf, 0, -1, false, base_lines)
-		vim.api.nvim_buf_set_name(base_buf, "ghreview://base/" .. file_path)
-		vim.bo[base_buf].buftype = "nofile"
-		vim.bo[base_buf].modifiable = false
-		vim.bo[base_buf].bufhidden = "wipe"
-
-		local ft = vim.filetype.match({ filename = file_path })
-		if ft then
-			vim.bo[base_buf].filetype = ft
-		end
-
 		current.base_buf = base_buf
 		current.base_win = vim.api.nvim_get_current_win()
 	end
 
-	-- Enable diff mode on both windows, disable folding
-	vim.api.nvim_win_call(current.base_win, function()
-		vim.cmd("diffthis")
-		vim.wo[0].foldenable = false
-	end)
-	vim.api.nvim_win_call(current.work_win, function()
-		vim.cmd("diffthis")
-		vim.wo[0].foldenable = false
-	end)
-
-	-- Move cursor to right window at target line
-	vim.api.nvim_set_current_win(current.work_win)
-	if target_line then
-		local line_count = vim.api.nvim_buf_line_count(current.work_buf)
-		local target = math.min(target_line, line_count)
-		vim.api.nvim_win_set_cursor(current.work_win, { target, 0 })
-		vim.cmd("normal! zz")
-	end
-
+	setup_diff_windows(target_line)
 	current.file_path = file_path
 
 	-- Set diagnostics on commit diff buffers (BufEnter fires before the name is set)

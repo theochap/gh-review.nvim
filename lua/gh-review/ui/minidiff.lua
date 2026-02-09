@@ -2,6 +2,7 @@
 local M = {}
 
 local state = require("gh-review.state")
+local util = require("gh-review.util")
 
 local ref_cache = {} -- buf_id → { path = string, lines = string[] }
 
@@ -36,15 +37,8 @@ function M.attach(buf)
   -- Get base content (cached per buffer)
   local cached = ref_cache[buf]
   if not cached or cached.path ~= cache_key then
-    local result = vim.system(
-      { "git", "show", base_ref .. ":" .. rel },
-      { text = true, cwd = cwd }
-    ):wait()
-    if result.code ~= 0 then return end
-    local lines = vim.split(result.stdout or "", "\n")
-    if #lines > 0 and lines[#lines] == "" then
-      table.remove(lines)
-    end
+    local lines = util.git_show_lines(base_ref .. ":" .. rel, cwd)
+    if #lines == 0 then return end
     ref_cache[buf] = { path = cache_key, lines = lines }
   end
 

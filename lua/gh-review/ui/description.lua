@@ -4,14 +4,7 @@ local M = {}
 local state = require("gh-review.state")
 local config = require("gh-review.config")
 local gh = require("gh-review.gh")
-
---- Format a timestamp for display
----@param ts string ISO 8601 timestamp
----@return string
-local function format_time(ts)
-  local date = ts:match("^(%d%d%d%d%-%d%d%-%d%d)")
-  return date or ts
-end
+local util = require("gh-review.util")
 
 --- Build the description buffer content
 ---@return string[]
@@ -19,7 +12,6 @@ local function build_lines()
   local pr = state.get_pr()
   if not pr then return { "(no active PR)" } end
 
-  local icons = config.get().icons
   local lines = {}
 
   -- Title
@@ -27,14 +19,7 @@ local function build_lines()
   table.insert(lines, "")
 
   -- Metadata line
-  local status_icon = ""
-  if pr.review_decision == "APPROVED" then
-    status_icon = icons.approved
-  elseif pr.review_decision == "CHANGES_REQUESTED" then
-    status_icon = icons.changes_requested
-  elseif pr.review_decision == "REVIEW_REQUIRED" then
-    status_icon = icons.review_required
-  end
+  local status_icon = util.review_icon(pr.review_decision)
   local status_str = pr.review_decision ~= "" and (pr.review_decision .. " " .. status_icon) or "PENDING"
   table.insert(lines, "Author: @" .. pr.author .. " | Status: " .. status_str .. " | Base: " .. pr.base_ref .. " <- " .. pr.head_ref)
   table.insert(lines, "URL: " .. pr.url)
@@ -72,7 +57,7 @@ local function build_lines()
   else
     local active_commit = state.get_active_commit()
     for _, c in ipairs(commits) do
-      local date = format_time(c.date or "")
+      local date = util.format_time(c.date or "")
       local prefix = (active_commit and active_commit.oid == c.oid) and "> " or "  "
       table.insert(lines, prefix .. "`" .. c.sha .. "` " .. c.message .. " — @" .. c.author .. " " .. date)
     end
@@ -89,7 +74,7 @@ local function build_lines()
   else
     for i, comment in ipairs(comments) do
       local author = comment.author or "unknown"
-      local date = format_time(comment.created_at or "")
+      local date = util.format_time(comment.created_at or "")
       table.insert(lines, "@" .. author .. " -- " .. date)
       for body_line in (comment.body or ""):gmatch("[^\n]*") do
         table.insert(lines, "  " .. body_line)
@@ -102,6 +87,8 @@ local function build_lines()
 
   return lines
 end
+
+M._build_lines = build_lines
 
 --- Show the PR description page in a bottom split
 function M.show()
@@ -198,14 +185,7 @@ function M.show()
     local preview = last.body:match("^([^\n]+)") or ""
     if #preview > 50 then preview = preview:sub(1, 47) .. "..." end
 
-    local context_lines = {}
-    for _, comment in ipairs(comments) do
-      table.insert(context_lines, "@" .. comment.author .. ":")
-      for body_line in comment.body:gmatch("[^\n]*") do
-        table.insert(context_lines, "  " .. body_line)
-      end
-      table.insert(context_lines, "")
-    end
+    local context_lines = util.build_thread_context(comments)
 
     require("gh-review.ui.comment_input").open({
       title = "Reply: " .. preview,

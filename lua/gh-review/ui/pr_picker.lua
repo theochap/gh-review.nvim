@@ -2,22 +2,7 @@
 local M = {}
 
 local gh = require("gh-review.gh")
-local config = require("gh-review.config")
-
---- Format review decision for display
----@param decision string?
----@return string
-local function review_badge(decision)
-  local icons = config.get().icons
-  if decision == "APPROVED" then
-    return " " .. icons.approved
-  elseif decision == "CHANGES_REQUESTED" then
-    return " " .. icons.changes_requested
-  elseif decision == "REVIEW_REQUIRED" then
-    return " " .. icons.review_required
-  end
-  return ""
-end
+local util = require("gh-review.util")
 
 --- Build preview lines for a PR
 ---@param pr table
@@ -39,8 +24,8 @@ local function build_preview(pr)
     table.insert(lines, "**Review:** " .. pr.reviewDecision)
   end
   if pr.createdAt then
-    local date = pr.createdAt:match("^(%d%d%d%d%-%d%d%-%d%d)")
-    if date then
+    local date = util.format_time(pr.createdAt)
+    if date ~= pr.createdAt then
       table.insert(lines, "**Created:** " .. date)
     end
   end
@@ -86,7 +71,8 @@ function M.show(opts)
     for _, pr in ipairs(prs) do
       local author = pr.author and pr.author.login or "unknown"
       local draft = pr.isDraft and "[DRAFT] " or ""
-      local badge = review_badge(pr.reviewDecision)
+      local icon = util.review_icon(pr.reviewDecision)
+      local badge = icon ~= "" and (" " .. icon) or ""
       -- text includes all searchable fields
       local text = string.format(
         "#%d %s%s @%s %s",

@@ -24,6 +24,25 @@ function M.run(args, callback, opts)
   end)
 end
 
+--- Run a gh command and JSON-decode the output
+---@param args string[] Arguments to pass to gh
+---@param callback fun(err: string?, data: table?) Called with decoded JSON
+---@param opts? { cwd?: string }
+function M.run_json(args, callback, opts)
+  M.run(args, function(err, output)
+    if err then
+      callback(err, nil)
+      return
+    end
+    local ok, data = pcall(vim.json.decode, output)
+    if not ok then
+      callback("JSON decode error: " .. tostring(data), nil)
+      return
+    end
+    callback(nil, data)
+  end, opts)
+end
+
 --- Run a gh command synchronously (for health checks etc.)
 ---@param args string[]
 ---@param opts? { cwd?: string }
@@ -54,21 +73,7 @@ end
 ---@param callback fun(err: string?, data: table?)
 function M.pr_view(pr_number, callback)
   local fields = "number,title,author,baseRefName,headRefName,url,reviewDecision,body"
-  M.run({
-    "pr", "view", tostring(pr_number),
-    "--json", fields,
-  }, function(err, output)
-    if err then
-      callback(err, nil)
-      return
-    end
-    local ok, data = pcall(vim.json.decode, output)
-    if not ok then
-      callback("Failed to parse PR JSON: " .. tostring(data), nil)
-      return
-    end
-    callback(nil, data)
-  end)
+  M.run_json({ "pr", "view", tostring(pr_number), "--json", fields }, callback)
 end
 
 --- Get PR changed files (via REST API for status info)
@@ -81,17 +86,12 @@ function M.pr_files(pr_number, callback)
       callback(err, nil)
       return
     end
-    M.run({
+    M.run_json({
       "api", "repos/" .. repo .. "/pulls/" .. tostring(pr_number) .. "/files",
       "--paginate",
-    }, function(err2, output)
+    }, function(err2, data)
       if err2 then
         callback(err2, nil)
-        return
-      end
-      local ok, data = pcall(vim.json.decode, output)
-      if not ok then
-        callback("Failed to parse files JSON: " .. tostring(data), nil)
         return
       end
       -- Map REST API fields to match expected format
@@ -125,17 +125,12 @@ end
 ---@param pr_number number
 ---@param callback fun(err: string?, comments: table?)
 function M.pr_comments(pr_number, callback)
-  M.run({
+  M.run_json({
     "pr", "view", tostring(pr_number),
     "--json", "comments",
-  }, function(err, output)
+  }, function(err, data)
     if err then
       callback(err, nil)
-      return
-    end
-    local ok, data = pcall(vim.json.decode, output)
-    if not ok then
-      callback("Failed to parse comments JSON: " .. tostring(data), nil)
       return
     end
     callback(nil, data.comments or {})
@@ -146,38 +141,19 @@ end
 ---@param callback fun(err: string?, data: table?)
 function M.pr_view_current(callback)
   local fields = "number,title,author,baseRefName,headRefName,url,reviewDecision,body"
-  M.run({
-    "pr", "view",
-    "--json", fields,
-  }, function(err, output)
-    if err then
-      callback(err, nil)
-      return
-    end
-    local ok, data = pcall(vim.json.decode, output)
-    if not ok then
-      callback("Failed to parse PR JSON: " .. tostring(data), nil)
-      return
-    end
-    callback(nil, data)
-  end)
+  M.run_json({ "pr", "view", "--json", fields }, callback)
 end
 
 --- Get PR commits
 ---@param pr_number number
 ---@param callback fun(err: string?, commits: table?)
 function M.pr_commits(pr_number, callback)
-  M.run({
+  M.run_json({
     "pr", "view", tostring(pr_number),
     "--json", "commits",
-  }, function(err, output)
+  }, function(err, data)
     if err then
       callback(err, nil)
-      return
-    end
-    local ok, data = pcall(vim.json.decode, output)
-    if not ok then
-      callback("Failed to parse commits JSON: " .. tostring(data), nil)
       return
     end
     callback(nil, data.commits or {})
@@ -201,22 +177,11 @@ end
 ---@param callback fun(err: string?, prs: table?)
 function M.pr_list(callback)
   local fields = "number,title,author,body,state,headRefName,isDraft,createdAt,reviewDecision"
-  M.run({
+  M.run_json({
     "pr", "list",
     "--json", fields,
     "--limit", "50",
-  }, function(err, output)
-    if err then
-      callback(err, nil)
-      return
-    end
-    local ok, data = pcall(vim.json.decode, output)
-    if not ok then
-      callback("Failed to parse PR list JSON: " .. tostring(data), nil)
-      return
-    end
-    callback(nil, data)
-  end)
+  }, callback)
 end
 
 --- Get repository owner/name
@@ -246,14 +211,9 @@ function M.graphql(query, variables, callback)
   table.insert(args, "-f")
   table.insert(args, "query=" .. query)
 
-  M.run(args, function(err, output)
+  M.run_json(args, function(err, data)
     if err then
       callback(err, nil)
-      return
-    end
-    local ok, data = pcall(vim.json.decode, output)
-    if not ok then
-      callback("Failed to parse GraphQL JSON: " .. tostring(data), nil)
       return
     end
     if data.errors then
