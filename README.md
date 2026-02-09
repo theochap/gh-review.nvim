@@ -1,8 +1,11 @@
 # gh-review.nvim
 
+[![CI](https://github.com/theochap/gh-review.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/theochap/gh-review.nvim/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/theochap/gh-review.nvim/coverage-badge/coverage.json)](https://github.com/theochap/gh-review.nvim/actions/workflows/ci.yml)
+
 Review GitHub Pull Requests without leaving Neovim.
 
-Checkout a PR, browse changed files, navigate inline comment threads, reply, resolve, and create new threads — all from your editor.
+Checkout a PR, browse changed files, navigate inline comment threads, reply, resolve, and create new threads — all from your editor. Filter your review to a single commit, navigate diff hunks across files, and get notified when your current branch has an open PR.
 
 ## Requirements
 
@@ -30,19 +33,26 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
     require("gh-review").setup()
   end,
   dependencies = {
-    "sindrets/diffview.nvim",  -- optional
+    "folke/snacks.nvim",       -- required
+    -- "echasnovski/mini.diff", -- optional
+    -- "folke/trouble.nvim",    -- optional
+    -- "sindrets/diffview.nvim", -- optional
   },
 }
 ```
 
 ## Usage
 
+The plugin auto-detects if your current branch has an open PR on startup and
+notifies you with a hint to press `<leader>gpO`.
+
 | Keymap | Command | Description |
 |---|---|---|
 | `<leader>gpo` | `:GHReview checkout [number]` | Checkout PR (fuzzy picker if no number) |
 | `<leader>gpO` | `:GHReview current` | Review PR for current branch |
 | `<leader>gpf` | `:GHReview files` | Toggle file tree sidebar |
-| `<leader>gpc` | `:GHReview comments` | Toggle comments panel |
+| `<leader>gpC` | | Toggle commits sidebar (filter by commit) |
+| `<leader>gpc` | `:GHReview comments` | Toggle comments panel (trouble.nvim) |
 | `<leader>gpr` | | Reply to thread at cursor |
 | `<leader>gpn` | | New inline comment thread |
 | `<leader>gpt` | | Toggle resolve/unresolve |
@@ -52,12 +62,15 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 | `<leader>gpe` | | Open file with diff overlay |
 | `<leader>gpR` | `:GHReview refresh` | Refresh PR data |
 | `<leader>gpq` | `:GHReview close` | Close review session |
-| `]c` / `[c` | | Next/previous comment |
+| `]c` / `[c` | | Next/previous comment (cross-file) |
+| `]d` / `[d` | | Next/previous diff hunk (cross-file) |
 
 **Buffer-local keymaps:**
 - Comment thread: `r` reply, `t` resolve, `o` browser, `q` close
-- Trouble panel: `r` reply, `t` resolve, `<cr>` jump to diff
-- Description: `q` close, `o` open PR URL
+- Trouble panel: `r` reply, `t` resolve, `v` view thread, `<cr>` jump to diff
+- Commits panel: `<cr>` select/deselect commit, `x` clear filter
+- Description: `q` close, `o` open in browser, `n` new comment, `r` reply,
+  `<cr>` select commit (on commit line), `x` clear filter
 - Comment input: `<C-s>` submit, `<Esc><Esc>` cancel
 
 ## Configuration
@@ -84,6 +97,9 @@ require("gh-review").setup({
     close = "q",
     next_comment = "]c",
     prev_comment = "[c",
+    commits = "C",
+    next_diff = "]d",
+    prev_diff = "[d",
   },
   icons = {
     added = "A",
@@ -111,11 +127,19 @@ require("gh-review").setup({
 
 ### Diff review
 
-Comment navigation and the files picker open a native Neovim diff split: working file on the right (modifiable) and base version on the left (readonly). Comment threads are rendered as virtual lines (extmarks) below their lines.
+Comment navigation and the files picker open a native Neovim diff split: working file on the right (modifiable) and base version on the left (readonly). Comment threads are rendered as virtual lines (extmarks) below their lines. When filtering by commit, both sides are readonly showing the commit's parent vs commit version.
+
+### Commit filtering
+
+`<leader>gpC` opens the commits sidebar. Select a commit to filter the entire session — files, comments, diagnostics, and diffs all narrow to that commit's changes. Select again or press `x` to return to the full PR view. Commits are also selectable from the description page.
 
 ### mini.diff
 
-When installed, opening any PR file automatically sets the base version as reference text for gutter signs. `<leader>gpD` toggles an inline overlay.
+When installed, opening any PR file automatically sets the base version as reference text for gutter signs. `<leader>gpD` toggles an inline overlay. When filtering by commit, gutter signs reflect changes from that single commit.
+
+### Trouble.nvim
+
+`<leader>gpc` toggles a bottom panel listing all comment threads as diagnostics-style items. Buffer-local keymaps: `r` reply, `t` toggle resolve, `v` view thread, `<cr>` jump to diff location.
 
 ### Lualine
 
@@ -128,6 +152,8 @@ require("lualine").setup({
   },
 })
 ```
+
+Shows PR number, head ref, and review status. When filtering by commit, appends the active commit SHA and message.
 
 ### Which-key
 

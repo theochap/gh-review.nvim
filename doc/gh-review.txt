@@ -124,6 +124,11 @@ override. Unspecified keys keep their defaults.
 
 A typical review session:
 
+0. Auto-detect on startup~
+   When the plugin loads, it checks if the current branch has an open PR.
+   If found, a notification shows the PR number and title with a hint to
+   press `<leader>gpO` to start reviewing. No data is loaded until you act.
+
 1. Start a review~
    - `:GHReview checkout` — pick a PR from a fuzzy list, checks out the
      branch and loads review data.
@@ -209,9 +214,6 @@ A typical review session:
   Show PR description page with title, author, body, review status, file
   stats, commits (press `<cr>` to select for filtering), and top-level
   comments.
-
-:GHReview commits                        *:GHReview-commits*
-  Toggle commits sidebar. Select a commit to filter the session.
 
 :GHReview refresh                        *:GHReview-refresh*
   Reload PR data (files, diff, threads).
