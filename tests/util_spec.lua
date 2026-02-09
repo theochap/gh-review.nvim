@@ -115,4 +115,86 @@ describe("util", function()
       assert.are.same({}, util.build_thread_context({}))
     end)
   end)
+
+  describe("git_show_lines", function()
+    it("returns lines from successful git show", function()
+      local orig_system = vim.system
+      vim.system = function(cmd, opts)
+        assert.are.equal("git", cmd[1])
+        assert.are.equal("show", cmd[2])
+        return {
+          wait = function()
+            return { code = 0, stdout = "line 1\nline 2\nline 3\n" }
+          end,
+        }
+      end
+
+      local lines = util.git_show_lines("main:file.lua", "/tmp/repo")
+      vim.system = orig_system
+
+      assert.are.equal(3, #lines)
+      assert.are.equal("line 1", lines[1])
+      assert.are.equal("line 3", lines[3])
+    end)
+
+    it("returns empty table on failure", function()
+      local orig_system = vim.system
+      vim.system = function()
+        return { wait = function() return { code = 128, stderr = "fatal" } end }
+      end
+
+      local lines = util.git_show_lines("main:missing.lua", "/tmp")
+      vim.system = orig_system
+
+      assert.are.same({}, lines)
+    end)
+
+    it("returns empty table when stdout is nil", function()
+      local orig_system = vim.system
+      vim.system = function()
+        return { wait = function() return { code = 0, stdout = nil } end }
+      end
+
+      local lines = util.git_show_lines("main:file.lua", "/tmp")
+      vim.system = orig_system
+
+      assert.are.same({}, lines)
+    end)
+
+    it("strips trailing blank line", function()
+      local orig_system = vim.system
+      vim.system = function()
+        return { wait = function() return { code = 0, stdout = "content\n" } end }
+      end
+
+      local lines = util.git_show_lines("ref:f", "/tmp")
+      vim.system = orig_system
+
+      assert.are.equal(1, #lines)
+      assert.are.equal("content", lines[1])
+    end)
+  end)
+
+  describe("create_scratch_buf", function()
+    it("creates a buffer with correct properties", function()
+      local buf = util.create_scratch_buf("test://buf", { "line 1", "line 2" }, "test.lua")
+
+      assert.are.equal("nofile", vim.bo[buf].buftype)
+      assert.is_false(vim.bo[buf].modifiable)
+      assert.are.equal("wipe", vim.bo[buf].bufhidden)
+
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      assert.are.same({ "line 1", "line 2" }, lines)
+
+      assert.are.equal("lua", vim.bo[buf].filetype)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("handles unknown file type", function()
+      local buf = util.create_scratch_buf("test://x", { "data" }, "file.xyz_unknown_ext")
+      assert.is_true(vim.api.nvim_buf_is_valid(buf))
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+  end)
 end)

@@ -72,6 +72,85 @@ describe("diff.parse", function()
     assert.are.equal(1, hunk.new_start)
     assert.are.equal(1, hunk.new_count)
   end)
+
+  it("handles diff with only added lines (new file)", function()
+    local new_file_diff = table.concat({
+      "diff --git a/new.lua b/new.lua",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/new.lua",
+      "@@ -0,0 +1,3 @@",
+      "+local M = {}",
+      "+M.version = 1",
+      "+return M",
+    }, "\n")
+    local files = diff.parse(new_file_diff)
+    assert.is_not_nil(files["new.lua"])
+    local hunk = files["new.lua"].hunks[1]
+    assert.are.equal(0, hunk.old_start)
+    assert.are.equal(0, hunk.old_count)
+    assert.are.equal(1, hunk.new_start)
+    assert.are.equal(3, hunk.new_count)
+    assert.are.equal(3, #hunk.lines)
+    for _, l in ipairs(hunk.lines) do
+      assert.are.equal("+", l:sub(1, 1))
+    end
+  end)
+
+  it("handles diff with only deleted lines (removed file)", function()
+    local deleted_diff = table.concat({
+      "diff --git a/old.lua b/old.lua",
+      "deleted file mode 100644",
+      "--- a/old.lua",
+      "+++ /dev/null",
+      "@@ -1,3 +0,0 @@",
+      "-local M = {}",
+      "-M.version = 1",
+      "-return M",
+    }, "\n")
+    local files = diff.parse(deleted_diff)
+    assert.is_not_nil(files["old.lua"])
+    local hunk = files["old.lua"].hunks[1]
+    assert.are.equal(1, hunk.old_start)
+    assert.are.equal(3, hunk.old_count)
+    assert.are.equal(0, hunk.new_start)
+    assert.are.equal(0, hunk.new_count)
+    assert.are.equal(3, #hunk.lines)
+    for _, l in ipairs(hunk.lines) do
+      assert.are.equal("-", l:sub(1, 1))
+    end
+  end)
+
+  it("handles renamed file diff header", function()
+    local rename_diff = table.concat({
+      "diff --git a/old_name.lua b/new_name.lua",
+      "similarity index 95%",
+      "rename from old_name.lua",
+      "rename to new_name.lua",
+      "--- a/old_name.lua",
+      "+++ b/new_name.lua",
+      "@@ -1,3 +1,3 @@",
+      " local M = {}",
+      "-M.version = 1",
+      "+M.version = 2",
+      " return M",
+    }, "\n")
+    local files = diff.parse(rename_diff)
+    assert.is_not_nil(files["new_name.lua"])
+    assert.are.equal(1, #files["new_name.lua"].hunks)
+    assert.are.equal(4, #files["new_name.lua"].hunks[1].lines)
+  end)
+
+  it("handles binary file diff (no hunks)", function()
+    local binary_diff = table.concat({
+      "diff --git a/image.png b/image.png",
+      "new file mode 100644",
+      "Binary files /dev/null and b/image.png differ",
+    }, "\n")
+    local files = diff.parse(binary_diff)
+    assert.is_not_nil(files["image.png"])
+    assert.are.same({}, files["image.png"].hunks)
+  end)
 end)
 
 describe("diff.map_to_working_tree", function()

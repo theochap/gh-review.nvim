@@ -9,31 +9,42 @@ CONTENTS                                                *gh-review-contents*
   2. Requirements ............................ |gh-review-requirements|
   3. Installation ............................ |gh-review-installation|
   4. Configuration ........................... |gh-review-configuration|
-  5. Commands ................................ |gh-review-commands|
-  6. Keybindings ............................. |gh-review-keybindings|
-  7. Integrations ............................ |gh-review-integrations|
+  5. Workflow ................................ |gh-review-workflow|
+  6. Commands ................................ |gh-review-commands|
+  7. Keybindings ............................. |gh-review-keybindings|
+  8. Integrations ............................ |gh-review-integrations|
 
 ==============================================================================
 1. INTRODUCTION                                      *gh-review-introduction*
 
 gh-review.nvim is a focused plugin for reviewing GitHub Pull Requests inside
-Neovim. It provides checkout, file browsing, inline comment navigation, and
-thread interaction (reply, resolve/unresolve, create new threads) via the
-GitHub GraphQL API.
+Neovim. It supports:
+
+- Full PR review with checkout or branch detection
+- Commit-level review: filter the entire session to a single commit
+- Native Neovim diff splits with inline comment overlays
+- Inline commenting: create threads, reply, resolve/unresolve
+- File tree sidebar with renamed-file display and diff stats
+- PR description page with clickable commits and top-level comments
+- Comment navigation across file boundaries
+- Diff hunk navigation across file boundaries
+- Statusline integration (lualine) showing PR state and active commit
 
 ==============================================================================
 2. REQUIREMENTS                                      *gh-review-requirements*
 
 - Neovim >= 0.10
 - `gh` CLI (https://cli.github.com/) authenticated (`gh auth login`)
-- snacks.nvim (https://github.com/folke/snacks.nvim) — for file/comment pickers
+- snacks.nvim (https://github.com/folke/snacks.nvim) — required for file
+  picker, PR picker, and commit sidebar
 
 Optional:~
-- diffview.nvim — for side-by-side diffs
-- mini.diff — for gutter signs and inline diff overlay on PR files
-- lualine.nvim — for statusline integration
-- which-key.nvim — for keymap discovery
-- trouble.nvim — for diagnostics list
+- mini.diff — gutter signs and inline diff overlay on PR files
+- lualine.nvim — statusline component showing PR state
+- which-key.nvim — keymap discovery for the `<leader>gp` group
+- trouble.nvim — diagnostics-style comment list panel
+- diffview.nvim — manual side-by-side diff overview (not used by plugin
+  navigation; can be opened independently)
 
 Run `:checkhealth gh-review` to verify.
 
@@ -47,7 +58,11 @@ Using lazy.nvim: >lua
       require("gh-review").setup()
     end,
     dependencies = {
-      "sindrets/diffview.nvim",  -- optional
+      "folke/snacks.nvim",              -- required
+      -- optional:
+      -- "echasnovski/mini.diff",
+      -- "folke/trouble.nvim",
+      -- "sindrets/diffview.nvim",
     },
   }
 <
@@ -101,9 +116,74 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
     },
   })
 <
+All sub-tables are deep-merged: you only need to specify keys you want to
+override. Unspecified keys keep their defaults.
 
 ==============================================================================
-5. COMMANDS                                            *gh-review-commands*
+5. WORKFLOW                                              *gh-review-workflow*
+
+A typical review session:
+
+1. Start a review~
+   - `:GHReview checkout` — pick a PR from a fuzzy list, checks out the
+     branch and loads review data.
+   - `:GHReview checkout 1234` — check out PR #1234 directly.
+   - `:GHReview current` — if already on a PR branch, load review data
+     without switching branches.
+
+2. Browse changed files~
+   - `<leader>gpf` opens the file tree sidebar. Directories with a single
+     child are collapsed (e.g. `a/b/c`). Renamed files display as
+     `old_name → new_name`. Each file shows status icon and +/- stats.
+   - Press `<cr>` on a file to open a diff split.
+
+3. View diffs~
+   - Full PR mode: left buffer is the base ref (readonly), right buffer is
+     the working tree file (modifiable). Both use `:diffthis`.
+   - Commit mode: left buffer is the commit's parent, right buffer is the
+     commit version. Both are readonly.
+   - Comment threads appear as virtual lines below their respective lines on
+     the right buffer. The focused thread uses `GHReviewInlineFocused`.
+
+4. Navigate comments~
+   - `]c` / `[c` jump to the next/previous comment, crossing file
+     boundaries. Falls through to gitsigns when no review is active.
+   - `<leader>gpc` toggles the trouble.nvim comment panel listing all
+     threads. Press `<cr>` to jump, `r` to reply, `t` to toggle resolve,
+     `v` to view the full thread.
+
+5. Navigate diff hunks~
+   - `]d` / `[d` jump to the next/previous diff hunk, crossing file
+     boundaries.
+
+6. View and reply to comments~
+   - `<leader>gpv` shows the comment thread at or near cursor (within 3
+     lines of proximity). The float displays the full thread.
+   - `<leader>gpr` opens a reply input for the thread at/near cursor.
+   - `<leader>gpn` creates a new inline comment thread at the cursor.
+   - `<leader>gpt` toggles resolve/unresolve on the thread at cursor.
+
+7. Filter by commit~
+   - `<leader>gpC` opens the commits sidebar. Press `<cr>` to select a
+     commit and filter the session to that commit's changes. Files,
+     comments, diagnostics, and diffs all narrow accordingly.
+   - Press `<cr>` again on the same commit or `x` to clear the filter.
+   - Commits are also listed on the description page (`<leader>gpd`) —
+     press `<cr>` on a commit line to select it.
+   - The lualine component shows the active commit SHA and message.
+
+8. PR description~
+   - `<leader>gpd` opens the description page showing title, author,
+     review status, base/head refs, URL, file stats, body, commits
+     (clickable), and top-level comments. Press `n` to add a new comment,
+     `r` to reply, `o` to open in browser.
+
+9. Refresh and close~
+   - `<leader>gpR` reloads PR data (files, diff, threads).
+   - `<leader>gpq` ends the review session, clearing diagnostics and state.
+
+==============================================================================
+6. COMMANDS                                            *gh-review-commands*
 
 :GHReview checkout [number]              *:GHReview-checkout*
   Check out a PR branch and load review data. If number is omitted, opens a
@@ -115,19 +195,23 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
   No PR number is needed — uses `gh pr view` for the current branch.
 
 :GHReview files                          *:GHReview-files*
-  Toggle file tree sidebar showing changed files.
-  Requires snacks.nvim.
+  Toggle file tree sidebar showing changed files. Directories with a single
+  child are collapsed. Renamed files show `old → new`. Requires snacks.nvim.
 
 :GHReview comments                       *:GHReview-comments*
   Toggle bottom panel showing all review comment threads
   (powered by trouble.nvim).
 
 :GHReview hover                          *:GHReview-hover*
-  Show the comment thread at or near cursor (within 3 lines).
+  Show the comment thread at or near cursor (within 3 lines proximity).
 
 :GHReview description                    *:GHReview-description*
-  Show PR description page with title, author, body, status, and
-  top-level comments.
+  Show PR description page with title, author, body, review status, file
+  stats, commits (press `<cr>` to select for filtering), and top-level
+  comments.
+
+:GHReview commits                        *:GHReview-commits*
+  Toggle commits sidebar. Select a commit to filter the session.
 
 :GHReview refresh                        *:GHReview-refresh*
   Reload PR data (files, diff, threads).
@@ -136,7 +220,7 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
   End the review session, clear diagnostics and state.
 
 ==============================================================================
-6. KEYBINDINGS                                        *gh-review-keybindings*
+7. KEYBINDINGS                                        *gh-review-keybindings*
 
 All keybindings are under `<leader>gp` by default.
 
@@ -146,14 +230,14 @@ Normal mode:~
   `<leader>gpO`   Review PR for current branch (no checkout needed)
   `<leader>gpf`   Toggle file tree sidebar
   `<leader>gpC`   Toggle commits sidebar (select to filter by commit)
-  `<leader>gpc`   Toggle comments panel
+  `<leader>gpc`   Toggle comments panel (trouble.nvim)
   `<leader>gpr`   Reply to thread at/near cursor
   `<leader>gpn`   New inline comment thread at cursor
   `<leader>gpt`   Toggle resolve/unresolve thread
-  `<leader>gpv`   View comment at/near cursor
+  `<leader>gpv`   View comment at/near cursor (3-line proximity)
   `<leader>gpd`   PR description page
   `<leader>gpD`   Toggle mini.diff inline overlay
-  `<leader>gpe`   Open file with diff overlay (close split, use mini.diff)
+  `<leader>gpe`   Open file with mini.diff overlay (close split)
   `<leader>gpR`   Refresh PR data
   `<leader>gpq`   Close review session
   `]c`            Next comment (falls through to gitsigns if no review)
@@ -164,14 +248,15 @@ Normal mode:~
 Buffer-local keymaps:~
 
 Comment thread:   `r` reply, `t` resolve, `o` browser, `q` close
-Trouble panel:    `r` reply, `t` resolve/unresolve, `v` view thread, `<cr>` jump to diff
+Trouble panel:    `r` reply, `t` resolve/unresolve, `v` view thread,
+                  `<cr>` jump to diff location
 Commits panel:    `<cr>` select/deselect commit, `x` clear commit filter
-Description:      `q` close, `o` browser, `n` new comment, `r` reply
-                  `<cr>` select commit (on commit line), `x` clear commit filter
+Description:      `q` close, `o` open in browser, `n` new comment, `r` reply,
+                  `<cr>` select commit (on commit line), `x` clear filter
 Comment input:    `<C-s>` submit, `<Esc><Esc>` cancel
 
 ==============================================================================
-7. INTEGRATIONS                                      *gh-review-integrations*
+8. INTEGRATIONS                                      *gh-review-integrations*
 
 Lualine~
 Add the component to your lualine config: >lua
@@ -183,6 +268,8 @@ Add the component to your lualine config: >lua
     },
   })
 <
+Displays `⎇ #1234 head_ref ✓` when a review is active. When filtering by
+commit, appends `@ abc1234 commit message` (message truncated to 30 chars).
 
 Diff Review~
 Comment navigation (picker selection, `]c`/`[c`, comment threads) and the
@@ -191,9 +278,17 @@ files picker open a native Neovim diff split: the working file on the right
 left (readonly scratch buffer). Both windows use `:diffthis` for built-in
 diff highlighting, folds, and scrollbind.
 
+When filtering by commit, the diff shows the commit's parent on the left and
+the commit version on the right. Both sides are readonly in commit mode.
+
 All comment threads for the file are rendered as virtual lines (extmarks)
 below their respective lines on the right buffer. The focused thread is
 highlighted with `GHReviewInlineFocused` (links to `CurSearch` by default).
+
+Renamed Files~
+Renamed files in the file sidebar display as `old_name → new_name` with the
+`R` status icon. The `_file_data` on each item includes `status = "renamed"`
+and `old_path` pointing to the original filename.
 
 Commit Filtering~
 Use `<leader>gpC` to open the commits sidebar listing all PR commits. Press
@@ -211,6 +306,15 @@ automatically sets the PR base version as the reference text. This gives you
 gutter signs (added/changed/deleted) without any extra steps. Use
 `<leader>gpD` to toggle an inline overlay showing the full diff as virtual
 text in the current buffer.
+
+When filtering by commit, mini.diff uses the commit's parent as the
+reference, so gutter signs reflect changes introduced by that single commit.
+
+Trouble.nvim (optional)~
+When trouble.nvim is installed, `<leader>gpc` toggles a bottom panel listing
+all comment threads as diagnostics-style items. Buffer-local keymaps in the
+trouble window: `r` reply, `t` toggle resolve, `v` view thread float,
+`<cr>` jump to the diff location.
 
 Diffview (optional)~
 If diffview.nvim is installed, you can still open it manually for a full

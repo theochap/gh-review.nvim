@@ -212,4 +212,7 @@ function M.show()
   })
 end
 
+M._build_items = build_items
+M._status_display = status_display
+
 return M
