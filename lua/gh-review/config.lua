@@ -16,6 +16,7 @@ local M = {}
 ---@field files string
 ---@field files_focus string
 ---@field comments string
+---@field comments_focus string
 ---@field reply string
 ---@field new_thread string
 ---@field toggle_resolve string
@@ -38,6 +39,7 @@ local M = {}
 ---@field unified string
 ---@field ignore_whitespace string
 ---@field toggle_linematch string
+---@field toggle_reviewed string
 
 ---@class GHReviewIcons
 ---@field added string
@@ -48,6 +50,7 @@ local M = {}
 ---@field changes_requested string
 ---@field review_required string
 ---@field branch string
+---@field reviewed string
 
 ---@class GHReviewFloat
 ---@field border string
@@ -69,6 +72,7 @@ M.defaults = {
     files = "f",
     files_focus = "F",
     comments = "c",
+    comments_focus = "Y",
     reply = "r",
     new_thread = "n",
     toggle_resolve = "t",
@@ -91,6 +95,7 @@ M.defaults = {
     unified = "u",
     ignore_whitespace = "W",
     toggle_linematch = "L",
+    toggle_reviewed = "m",
   },
   icons = {
     added = "A",
@@ -101,6 +106,7 @@ M.defaults = {
     changes_requested = "✗",
     review_required = "◔",
     branch = "⎇",
+    reviewed = "✓",
   },
   float = {
     border = "rounded",

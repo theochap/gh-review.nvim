@@ -518,6 +518,32 @@ function M.open_unified()
   require("gh-review.ui.unified").open(rel, line)
 end
 
+--- Toggle the "reviewed" mark on the current PR file. The mark is
+--- session-scoped (cleared on review close) and shown in the file tree.
+function M.toggle_reviewed()
+  if not require_active() then return end
+  local rel = M._current_rel_path()
+  if not rel then
+    vim.notify("GHReview: no active file", vim.log.levels.WARN)
+    return
+  end
+  local now_reviewed = state.toggle_reviewed(rel)
+  vim.notify(
+    "GHReview: " .. rel .. " " .. (now_reviewed and "marked reviewed" or "unmarked"),
+    vim.log.levels.INFO
+  )
+  -- Refresh the files picker if it's open so the mark updates immediately.
+  -- Use an in-place list render (not picker:find) so the cursor stays
+  -- where the user had it instead of snapping back to the top.
+  pcall(function()
+    local Snacks = require("snacks")
+    for _, picker in ipairs(Snacks.picker.get({ source = "gh_review_files" })) do
+      picker.list:set_target(picker.list.cursor, picker.list.top, { force = true })
+      picker.list:update({ force = true })
+    end
+  end)
+end
+
 --- Open or close the file tree sidebar (no intermediate focus step).
 function M.files()
   if not require_active() then return end
@@ -530,16 +556,26 @@ function M.files_focus()
   require("gh-review.ui.files").focus()
 end
 
---- Toggle comments panel (open / focus / close cycle)
+--- Open or close the comments panel. Strict two-state toggle — closes the
+--- trouble panel if it's open regardless of where the cursor is; opens it
+--- otherwise. Complement to `M.comments_focus`.
 function M.comments()
   if not require_active() then return end
   local trouble = require("trouble")
   if trouble.is_open("gh_review") then
-    if vim.bo.filetype == "trouble" then
-      trouble.close("gh_review")
-    else
-      trouble.focus("gh_review")
-    end
+    trouble.close("gh_review")
+  else
+    trouble.open("gh_review")
+  end
+end
+
+--- Focus the comments panel, opening it if closed. Does not close when
+--- already focused (use M.comments for that).
+function M.comments_focus()
+  if not require_active() then return end
+  local trouble = require("trouble")
+  if trouble.is_open("gh_review") then
+    trouble.focus("gh_review")
   else
     trouble.open("gh_review")
   end
@@ -760,13 +796,10 @@ local function navigate_diff(forward)
     vim.schedule(function()
       local ok2, MD = pcall(require, "mini.diff")
       if not ok2 then return end
-      if forward then
-        vim.cmd("normal! gg")
-        pcall(MD.goto_hunk, "next", { wrap = false })
-      else
-        vim.cmd("normal! G")
-        pcall(MD.goto_hunk, "prev", { wrap = false })
-      end
+      -- Jump to the file's first (or last) hunk directly — avoids the
+      -- off-by-one you get from `gg]c` when the top of the file is
+      -- already inside a hunk.
+      pcall(MD.goto_hunk, forward and "first" or "last")
       vim.cmd("normal! zz")
     end)
     return
@@ -801,17 +834,17 @@ local function navigate_diff(forward)
   M._open_file(adj.path)
   vim.schedule(function()
     local win = diff_review.get_work_win()
-    if win then
-      vim.api.nvim_win_call(win, function()
-        if forward then
-          vim.cmd("normal! gg")
-          pcall(vim.cmd, "normal! ]czz")
-        else
-          vim.cmd("normal! G")
-          pcall(vim.cmd, "normal! [czz")
-        end
-      end)
-    end
+    if not win then return end
+    vim.api.nvim_win_call(win, function()
+      vim.cmd("normal! " .. (forward and "gg" or "G"))
+      -- If the landing line isn't already part of a diff, step onto the
+      -- nearest one. Avoids `gg]c` skipping the first hunk when the top
+      -- of the file is itself inside a change.
+      if vim.fn.diff_hlID(vim.fn.line("."), 1) == 0 then
+        pcall(vim.cmd, "normal! " .. (forward and "]c" or "[c"))
+      end
+      vim.cmd("normal! zz")
+    end)
   end)
 end
 
@@ -1187,7 +1220,8 @@ function M._setup_keymaps()
   map(km.files, M.files, "Open/close file tree")
   map(km.files_focus, M.files_focus, "Focus file tree")
   map(km.commits, M.commits_panel, "Toggle commits panel")
-  map(km.comments, M.comments, "Toggle comments panel")
+  map(km.comments, M.comments, "Open/close comments panel")
+  map(km.comments_focus, M.comments_focus, "Focus comments panel")
   map(km.reply, M.reply, "Reply to thread")
   map(km.new_thread, M.new_thread, "New comment thread")
   -- Visual-mode variant: spans the selection as a multi-line thread.
@@ -1207,6 +1241,7 @@ function M._setup_keymaps()
   map(km.open_minidiff, M.open_minidiff, "Open file with diff overlay")
   map(km.diffview, M.diffview, "Open diffview.nvim")
   map(km.unified, M.open_unified, "Open unified single-buffer diff view")
+  map(km.toggle_reviewed, M.toggle_reviewed, "Toggle reviewed mark on current file")
   map(km.ignore_whitespace, M.toggle_ignore_whitespace, "Toggle ignore whitespace-only changes")
   map(km.toggle_linematch, M.toggle_linematch, "Toggle linematch (char highlights vs grouped blocks)")
   map(km.toggle_view, M.toggle_view, "Toggle split / inline view")

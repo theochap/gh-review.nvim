@@ -193,4 +193,85 @@ describe("state", function()
       assert.is_nil(state.get_nearest_thread("a.lua", 11))
     end)
   end)
+
+  describe("reviewed files", function()
+    it("is_reviewed defaults to false", function()
+      assert.is_false(state.is_reviewed("src/a.lua"))
+    end)
+
+    it("set_reviewed(true) marks the file", function()
+      state.set_reviewed("src/a.lua", true)
+      assert.is_true(state.is_reviewed("src/a.lua"))
+    end)
+
+    it("set_reviewed(false) unmarks the file", function()
+      state.set_reviewed("src/a.lua", true)
+      state.set_reviewed("src/a.lua", false)
+      assert.is_false(state.is_reviewed("src/a.lua"))
+    end)
+
+    it("toggle_reviewed flips and returns the new state", function()
+      assert.is_true(state.toggle_reviewed("src/a.lua"))
+      assert.is_true(state.is_reviewed("src/a.lua"))
+      assert.is_false(state.toggle_reviewed("src/a.lua"))
+      assert.is_false(state.is_reviewed("src/a.lua"))
+    end)
+
+    it("get_reviewed_files returns every marked path", function()
+      state.set_reviewed("src/a.lua", true)
+      state.set_reviewed("src/b.lua", true)
+      local list = state.get_reviewed_files()
+      table.sort(list)
+      assert.are.same({ "src/a.lua", "src/b.lua" }, list)
+    end)
+
+    it("clear wipes the reviewed set", function()
+      state.set_reviewed("src/a.lua", true)
+      state.clear()
+      assert.is_false(state.is_reviewed("src/a.lua"))
+      assert.are.same({}, state.get_reviewed_files())
+    end)
+  end)
+
+  describe("reviewed persistence across set_pr", function()
+    local original_stdpath, tmp_data
+
+    before_each(function()
+      tmp_data = vim.fn.tempname()
+      vim.fn.mkdir(tmp_data, "p")
+      original_stdpath = vim.fn.stdpath
+      ---@diagnostic disable-next-line: duplicate-set-field
+      vim.fn.stdpath = function(what)
+        if what == "data" then return tmp_data end
+        return original_stdpath(what)
+      end
+      -- The store module is cached; it looks at stdpath each call so no reload needed.
+    end)
+
+    after_each(function()
+      vim.fn.stdpath = original_stdpath
+      vim.fn.delete(tmp_data, "rf")
+    end)
+
+    it("reloads reviewed marks when set_pr is called with a persisted PR", function()
+      -- First session: mark a file
+      state.set_pr({ number = 42, title = "T", repository = "owner/repo" })
+      state.set_reviewed("src/a.lua", true)
+      assert.is_true(state.is_reviewed("src/a.lua"))
+
+      -- Simulate a fresh session: clear + set_pr again (same PR) reloads
+      state.clear()
+      assert.is_false(state.is_reviewed("src/a.lua"))
+      state.set_pr({ number = 42, title = "T", repository = "owner/repo" })
+      assert.is_true(state.is_reviewed("src/a.lua"))
+    end)
+
+    it("does not persist when PR has no repository/number", function()
+      state.set_pr({ number = 1, title = "test" })
+      state.set_reviewed("src/a.lua", true)
+      state.clear()
+      state.set_pr({ number = 1, title = "test" })
+      assert.is_false(state.is_reviewed("src/a.lua"))
+    end)
+  end)
 end)

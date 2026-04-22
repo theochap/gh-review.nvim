@@ -83,6 +83,7 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
       files = "f",
       files_focus = "F",
       comments = "c",
+      comments_focus = "Y",
       reply = "r",
       new_thread = "n",
       toggle_resolve = "t",
@@ -94,6 +95,7 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
       unified = "u",
       ignore_whitespace = "W",
       toggle_linematch = "L",
+      toggle_reviewed = "m",
       toggle_view = "V",
       refresh = "R",
       close = "q",
@@ -248,7 +250,8 @@ Normal mode:~
   `<leader>gpf`   Open or close file tree sidebar
   `<leader>gpF`   Focus file tree sidebar (opens it if closed)
   `<leader>gpC`   Toggle commits sidebar (select to filter by commit)
-  `<leader>gpc`   Toggle comments panel (trouble.nvim)
+  `<leader>gpc`   Open/close comments panel (trouble.nvim)
+  `<leader>gpY`   Focus comments panel (opens it if closed)
   `<leader>gpr`   Reply to thread at/near cursor
   `<leader>gpn`   New inline comment thread at cursor
   `<leader>gpt`   Toggle resolve/unresolve thread
@@ -260,6 +263,7 @@ Normal mode:~
   `<leader>gpu`   Open unified single-buffer diff view of current file
   `<leader>gpW`   Toggle ignore-whitespace-only changes (all views)
   `<leader>gpL`   Toggle linematch (char highlights vs grouped blocks)
+  `<leader>gpm`   Toggle "reviewed" mark on the current PR file
   `<leader>gpV`   Toggle split / inline view for current file
   `<leader>gpR`   Refresh PR data
   `<leader>gpq`   Close review session
@@ -329,6 +333,18 @@ falls back to split view and notifies.
 All comment threads for the file are rendered as virtual lines (extmarks)
 below their respective lines on the right buffer. The focused thread is
 highlighted with `GHReviewInlineFocused` (links to `CurSearch` by default).
+
+Reviewed marker~
+Press `<leader>gpm` on a PR file to toggle a "reviewed" mark. Marked files
+show a ✓ in the file tree next to the status icon (configurable via
+`icons.reviewed`). Marks are session-scoped and cleared when the review
+session ends. Inside the file tree picker, pressing `m` on the selected
+item toggles the mark without leaving the picker.
+
+When the file tree opens, the cursor is placed on the item matching the
+buffer you currently have open (regardless of whether it's a working-tree
+file, a `ghreview://base/…`/`commit/…`/`unified/…` scratch buffer, or in
+the native split).
 
 Renamed Files~
 Renamed files in the file sidebar display as `old_name → new_name` with the

@@ -73,13 +73,23 @@ function M.get(cb, ctx)
     local resolved = thread.is_resolved and "[resolved] " or ""
     local replies = #thread.comments > 1 and (" [+" .. (#thread.comments - 1) .. " replies]") or ""
 
+    -- Range label in GitHub's diff-side numbering so multi-line threads are
+    -- visibly spans, not just the anchor line. `thread.line` is the end line
+    -- (diff-side) and `thread.start_line` is the start (nil for single-line).
+    local range_label
+    if thread.start_line and thread.line and thread.start_line ~= thread.line then
+      range_label = "L" .. thread.start_line .. "-" .. thread.line
+    else
+      range_label = "L" .. (thread.line or raw_line or "?")
+    end
+
     table.insert(items, Item.new({
       source = "gh_review",
       filename = cwd .. "/" .. thread.path,
       pos = { line, 0 },
       end_pos = { line, 0 },
       severity = thread.is_resolved and vim.diagnostic.severity.HINT or vim.diagnostic.severity.INFO,
-      message = resolved .. "@" .. author .. ": " .. body .. replies,
+      message = resolved .. range_label .. " @" .. author .. ": " .. body .. replies,
       item = { thread = thread },
     }))
   end
