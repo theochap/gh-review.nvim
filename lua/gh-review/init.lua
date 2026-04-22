@@ -29,6 +29,19 @@ local function close_snacks_picker(source)
   end)
 end
 
+--- Apply gh-review's overlay highlight tweaks:
+---   - MiniDiffOverContext → DiffDelete so the reference-side context block
+---     shares the red tint with pure deletions.
+---   - MiniDiffOverChange → an explicit orange background so the actually-
+---     changed characters within a line pop against the surrounding red,
+---     instead of the default DiffText blue which can clash with it.
+--- A light/dark-appropriate shade is picked from `vim.o.background`.
+function M._apply_overlay_highlights()
+  vim.api.nvim_set_hl(0, "MiniDiffOverContext", { link = "DiffDelete" })
+  local orange_bg = vim.o.background == "light" and "#ffd8a8" or "#5a3a1a"
+  vim.api.nvim_set_hl(0, "MiniDiffOverChange", { bg = orange_bg })
+end
+
 --- Plugin setup
 ---@param user_config? table
 function M.setup(user_config)
@@ -40,6 +53,15 @@ function M.setup(user_config)
   vim.schedule(function()
     require("gh-review.integrations.which_key").register()
   end)
+
+  -- Apply overlay highlight tweaks now, and re-apply after any colorscheme
+  -- change (colorschemes typically re-run MiniDiff's default highlight setup,
+  -- which would otherwise revert our links).
+  M._apply_overlay_highlights()
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    group = vim.api.nvim_create_augroup("GHReviewHighlights", { clear = true }),
+    callback = function() M._apply_overlay_highlights() end,
+  })
 
   -- Auto-detect PR for current branch after startup
   M._schedule_pr_detection()
@@ -155,12 +177,26 @@ function M._load_pr_data(pr_number, callback)
         title = data.title,
         author = data.author and data.author.login or "unknown",
         base_ref = data.baseRefName,
+        base_sha = util.git_merge_base(data.baseRefName, vim.fn.getcwd()),
         head_ref = data.headRefName,
         url = data.url,
         body = data.body or "",
         review_decision = data.reviewDecision or "",
         repository = repo,
       })
+
+      -- Seed view mode from config only on first PR load of the session
+      -- so a user's toggle choice persists across refreshes.
+      if not state.get_view_mode() then
+        state.set_view_mode(config.get().default_view_mode or "split")
+      end
+
+      -- Apply default ignore-whitespace preference. Done inside the PR-id
+      -- branch (rather than at plugin setup) so it only takes effect while a
+      -- review is active; M.close reliably unwinds it.
+      if config.get().default_ignore_whitespace and not util.ignore_whitespace_active() then
+        util.enable_ignore_whitespace()
+      end
 
       local owner, repo_name = repo:match("^(.+)/(.+)$")
       if not owner or not repo_name then
@@ -280,38 +316,163 @@ function M.refresh(callback)
   M._load_pr_data(pr.number, callback)
 end
 
---- Open current diff file in a normal buffer with mini.diff overlay
+--- Open a PR file in whatever view mode is currently active.
+--- Deleted files can only be shown in split view, so we fall back transparently.
+---@param path string PR-relative file path
+---@param line? number Optional cursor target line
+function M._open_file(path, line)
+  local diff_review = require("gh-review.ui.diff_review")
+  local minidiff = require("gh-review.ui.minidiff")
+  local mode = state.get_view_mode() or "split"
+
+  if mode == "inline" then
+    for _, f in ipairs(state.get_effective_files()) do
+      if f.path == path and f.status == "deleted" then
+        vim.notify("GHReview: inline view unavailable for deleted files; using split", vim.log.levels.INFO)
+        diff_review.open(path, line)
+        return
+      end
+    end
+    diff_review.close()
+    M._open_inline(path, line)
+  else
+    -- Turn off the inline overlay on the target buffer to avoid clashing
+    -- virtual text on top of the split's diff highlights.
+    local existing = vim.fn.bufnr(vim.fn.getcwd() .. "/" .. path)
+    if existing ~= -1 then
+      minidiff.set_overlay(existing, false)
+    end
+    diff_review.open(path, line)
+  end
+end
+
+--- Open a PR file in inline (mini.diff overlay) view.
+--- For commit-scoped review, creates a scratch buffer with the commit's file content
+--- so the overlay reflects the commit vs its parent, not the working tree.
+---@param path string PR-relative file path
+---@param line? number Optional cursor target line
+function M._open_inline(path, line)
+  local pr = state.get_pr()
+  if not pr then return end
+
+  local cwd = vim.fn.getcwd()
+  local active_commit = state.get_active_commit()
+  local minidiff = require("gh-review.ui.minidiff")
+
+  local buf
+  if active_commit then
+    local lines = util.git_show_lines(active_commit.oid .. ":" .. path, cwd)
+    local short_sha = active_commit.oid:sub(1, 8)
+    buf = util.create_scratch_buf("ghreview://commit/" .. short_sha .. "/" .. path, lines, path)
+    vim.api.nvim_win_set_buf(0, buf)
+  else
+    vim.cmd("edit " .. vim.fn.fnameescape(cwd .. "/" .. path))
+    buf = vim.api.nvim_get_current_buf()
+  end
+
+  if line then
+    local target = math.min(line, math.max(vim.api.nvim_buf_line_count(buf), 1))
+    pcall(vim.api.nvim_win_set_cursor, 0, { target, 0 })
+    vim.cmd("normal! zz")
+  end
+
+  minidiff.attach(buf, { rel_path = path })
+  minidiff.set_overlay(buf, true)
+
+  -- Refresh diagnostics for commit scratch buffers (BufEnter misses them).
+  if active_commit then
+    diagnostics.refresh_buf(buf)
+  end
+end
+
+--- Toggle between split and inline view for the current file.
+--- The choice sticks for the remainder of the session (until close or config change).
+function M.toggle_view()
+  if not require_active() then return end
+
+  local diff_review = require("gh-review.ui.diff_review")
+  local rel_path, line
+
+  if diff_review.is_diff_active() then
+    rel_path = diff_review.get_file_path()
+    local work_win = diff_review.get_work_win()
+    if work_win then
+      line = vim.api.nvim_win_get_cursor(work_win)[1]
+    end
+  else
+    rel_path = M._current_rel_path()
+    if rel_path then
+      line = vim.api.nvim_win_get_cursor(0)[1]
+    end
+  end
+
+  if not rel_path then
+    vim.notify("GHReview: no active file to toggle view for", vim.log.levels.WARN)
+    return
+  end
+
+  local current = state.get_view_mode() or "split"
+  local new_mode = current == "split" and "inline" or "split"
+  state.set_view_mode(new_mode)
+
+  M._open_file(rel_path, line)
+  vim.notify("GHReview: view mode → " .. new_mode, vim.log.levels.INFO)
+end
+
+--- Open current diff file with mini.diff overlay (legacy entry point).
+--- Equivalent to switching to inline view and opening the current file.
 function M.open_minidiff()
   if not require_active() then return end
 
   local diff_review = require("gh-review.ui.diff_review")
-  local file_path = diff_review.get_file_path()
-  if not file_path then
-    file_path = M._current_rel_path()
-  end
+  local file_path = diff_review.get_file_path() or M._current_rel_path()
   if not file_path then
     vim.notify("GHReview: no file to open", vim.log.levels.WARN)
     return
   end
 
-  -- Close diff split if open
-  diff_review.close()
-
-  -- Open the file normally
-  local cwd = vim.fn.getcwd()
-  vim.cmd("edit " .. vim.fn.fnameescape(cwd .. "/" .. file_path))
-
-  -- Attach mini.diff and turn on overlay
-  local minidiff = require("gh-review.ui.minidiff")
-  local buf = vim.api.nvim_get_current_buf()
-  minidiff.attach(buf)
-  minidiff.toggle_overlay()
+  state.set_view_mode("inline")
+  M._open_file(file_path)
 end
 
 --- Toggle mini.diff overlay on current buffer
 function M.toggle_overlay()
   if not require_active() then return end
   require("gh-review.ui.minidiff").toggle_overlay()
+end
+
+--- Toggle whitespace-only hunk filtering across the split, diffview, and
+--- inline views. Flips 'diffopt' (for :diffthis-based views) and wraps
+--- vim.diff (for mini.diff) so the same preference reaches every surface.
+function M.toggle_ignore_whitespace()
+  if not require_active() then return end
+  if util.ignore_whitespace_active() then
+    util.disable_ignore_whitespace()
+    vim.notify("GHReview: showing all whitespace changes", vim.log.levels.INFO)
+  else
+    util.enable_ignore_whitespace()
+    vim.notify("GHReview: hiding whitespace-only changes", vim.log.levels.INFO)
+  end
+  -- Force :diffthis windows to redraw and mini.diff to recompute hunks.
+  pcall(vim.cmd, "diffupdate")
+  require("gh-review.ui.minidiff").refresh_all()
+end
+
+--- Toggle linematch between Neovim's default (interleaved pairs with
+--- DiffText highlights) and suppressed (grouped deletion/addition blocks,
+--- no intra-line highlight). Applies to the split, diffview, and inline
+--- views via the same mechanism as ignore_whitespace.
+function M.toggle_linematch()
+  if not require_active() then return end
+  if util.linematch_suppressed() then
+    util.restore_linematch()
+    vim.notify("GHReview: linematch on (char-level highlights, interleaved pairs)", vim.log.levels.INFO)
+  else
+    util.suppress_linematch()
+    vim.notify("GHReview: linematch off (grouped blocks)", vim.log.levels.INFO)
+  end
+  pcall(vim.cmd, "diffupdate")
+  require("gh-review.ui.minidiff").refresh_all()
 end
 
 --- Close the review session
@@ -324,6 +485,9 @@ function M.close()
   -- Close trouble comments panel if open
   pcall(function() require("trouble").close("gh_review") end)
   require("gh-review.integrations.diffview").close()
+  require("gh-review.ui.unified").close()
+  util.disable_ignore_whitespace()
+  util.restore_linematch()
   state.clear()
   vim.notify("GHReview: review session closed", vim.log.levels.INFO)
 end
@@ -334,10 +498,36 @@ function M.commits_panel()
   require("gh-review.ui.commits").toggle()
 end
 
---- Toggle file tree sidebar
+--- Open diffview.nvim for the active PR (merge-base ... HEAD).
+--- Requires diffview.nvim; warns if not installed.
+function M.diffview()
+  if not require_active() then return end
+  require("gh-review.integrations.diffview").open()
+end
+
+--- Open the current-buffer PR file in the unified single-buffer view
+--- (deletions as a block above additions as a block, VS Code-style).
+function M.open_unified()
+  if not require_active() then return end
+  local rel = M._current_rel_path()
+  if not rel then
+    vim.notify("GHReview: no active file", vim.log.levels.WARN)
+    return
+  end
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  require("gh-review.ui.unified").open(rel, line)
+end
+
+--- Open or close the file tree sidebar (no intermediate focus step).
 function M.files()
   if not require_active() then return end
-  require("gh-review.ui.files").toggle()
+  require("gh-review.ui.files").open_or_close()
+end
+
+--- Focus the file tree sidebar, opening it if closed.
+function M.files_focus()
+  if not require_active() then return end
+  require("gh-review.ui.files").focus()
 end
 
 --- Toggle comments panel (open / focus / close cycle)
@@ -392,7 +582,7 @@ function M._goto_thread(thread)
   local line = thread.mapped_line or thread.line
   if not line then return end
 
-  require("gh-review.ui.diff_review").open(thread.path, line)
+  M._open_file(thread.path, line)
 
   vim.schedule(function()
     -- If trouble panel is open, it auto-follows; otherwise show floating popup
@@ -501,6 +691,38 @@ function M._at_boundary_hunk(direction)
   return at_boundary
 end
 
+--- Pick the next/previous non-deleted file in the effective files list
+--- relative to `current_rel`. Returns a file table or nil.
+---@param current_rel string?
+---@param forward boolean
+---@return table? file
+local function adjacent_pr_file(current_rel, forward)
+  local files = state.get_effective_files()
+  if #files == 0 then return nil end
+
+  local idx
+  if current_rel then
+    for i, f in ipairs(files) do
+      if f.path == current_rel then idx = i; break end
+    end
+  end
+  if not idx then
+    -- Caller is not on a known PR file — start at one end.
+    idx = forward and 0 or (#files + 1)
+  end
+
+  if forward then
+    for i = idx + 1, #files do
+      if files[i].status ~= "deleted" then return files[i] end
+    end
+  else
+    for i = idx - 1, 1, -1 do
+      if files[i].status ~= "deleted" then return files[i] end
+    end
+  end
+  return nil
+end
+
 --- Navigate to next or previous diff hunk, crossing file boundaries
 ---@param forward boolean true for next, false for previous
 local function navigate_diff(forward)
@@ -508,7 +730,49 @@ local function navigate_diff(forward)
   local motion = forward and "]c" or "[c"
   local boundary_dir = forward and "next" or "prev"
 
-  if not state.is_active() or not diff_review.is_diff_active() then
+  if not state.is_active() then
+    pcall(vim.cmd, "normal! " .. motion)
+    return
+  end
+
+  -- Inline view: delegate hunk motion to mini.diff and cross files when the
+  -- cursor doesn't move (i.e. we're at the first/last hunk of the buffer).
+  if state.get_view_mode() == "inline" then
+    local ok, MiniDiff = pcall(require, "mini.diff")
+    if not ok then return end
+
+    local before = vim.api.nvim_win_get_cursor(0)
+    -- Force wrap=false so the before/after check is meaningful even if the
+    -- user has mini.diff's wrap_goto enabled globally.
+    pcall(MiniDiff.goto_hunk, forward and "next" or "prev", { wrap = false })
+    local after = vim.api.nvim_win_get_cursor(0)
+    if before[1] ~= after[1] or before[2] ~= after[2] then
+      return -- moved within the file
+    end
+
+    local adj = adjacent_pr_file(M._current_rel_path(), forward)
+    if not adj then
+      vim.notify("GHReview: " .. (forward and "last" or "first") .. " file in PR", vim.log.levels.INFO)
+      return
+    end
+
+    M._open_file(adj.path)
+    vim.schedule(function()
+      local ok2, MD = pcall(require, "mini.diff")
+      if not ok2 then return end
+      if forward then
+        vim.cmd("normal! gg")
+        pcall(MD.goto_hunk, "next", { wrap = false })
+      else
+        vim.cmd("normal! G")
+        pcall(MD.goto_hunk, "prev", { wrap = false })
+      end
+      vim.cmd("normal! zz")
+    end)
+    return
+  end
+
+  if not diff_review.is_diff_active() then
     pcall(vim.cmd, "normal! " .. motion)
     return
   end
@@ -528,29 +792,13 @@ local function navigate_diff(forward)
   local idx, files = M._get_current_file_index()
   if not idx or not files then return end
 
-  local adj_idx = nil
-  if forward then
-    for i = idx + 1, #files do
-      if files[i].status ~= "deleted" then
-        adj_idx = i
-        break
-      end
-    end
-  else
-    for i = idx - 1, 1, -1 do
-      if files[i].status ~= "deleted" then
-        adj_idx = i
-        break
-      end
-    end
-  end
-
-  if not adj_idx then
+  local adj = adjacent_pr_file(files[idx].path, forward)
+  if not adj then
     vim.notify("GHReview: " .. (forward and "last" or "first") .. " file in PR", vim.log.levels.INFO)
     return
   end
 
-  diff_review.open(files[adj_idx].path)
+  M._open_file(adj.path)
   vim.schedule(function()
     local win = diff_review.get_work_win()
     if win then
@@ -577,6 +825,53 @@ function M.prev_diff()
   navigate_diff(false)
 end
 
+--- Navigate to next or previous PR file in the effective files list.
+--- Silent no-op when no review is active (keybind matches ]c / ]d behavior
+--- of doing nothing useful outside PR mode rather than notifying).
+---@param forward boolean true for next, false for previous
+local function navigate_file(forward)
+  if not state.is_active() then return end
+
+  local files = state.get_effective_files()
+  if #files == 0 then return end
+
+  -- Work from the current buffer's relative path so navigation works in
+  -- inline view, the native split, ghreview:// scratch buffers, and any
+  -- other context where the user is sitting on a PR file.
+  local current_rel = M._current_rel_path()
+  local idx
+  if current_rel then
+    for i, f in ipairs(files) do
+      if f.path == current_rel then
+        idx = i
+        break
+      end
+    end
+  end
+  if not idx then
+    -- Not on a recognised PR file — jump to first (going forward) or last (back).
+    idx = forward and 0 or (#files + 1)
+  end
+
+  local next_idx = forward and (idx + 1) or (idx - 1)
+  if next_idx < 1 or next_idx > #files then
+    vim.notify("GHReview: " .. (forward and "last" or "first") .. " file in PR", vim.log.levels.INFO)
+    return
+  end
+
+  M._open_file(files[next_idx].path)
+end
+
+--- Jump to next file in the PR
+function M.next_file()
+  navigate_file(true)
+end
+
+--- Jump to previous file in the PR
+function M.prev_file()
+  navigate_file(false)
+end
+
 --- Reply to the thread at cursor position
 function M.reply()
   if not require_active() then return end
@@ -592,8 +887,12 @@ function M.reply()
   M._reply_to_thread(thread)
 end
 
---- Start a new inline comment thread at cursor
-function M.new_thread()
+--- Start a new inline comment thread at cursor, or across a visual range.
+--- When `start_line` and `end_line` are both given, creates a multi-line
+--- thread spanning those lines. With no args, falls back to the cursor line.
+---@param start_line? number
+---@param end_line? number
+function M.new_thread(start_line, end_line)
   if not require_active() then return end
 
   local pr = state.get_pr()
@@ -603,25 +902,34 @@ function M.new_thread()
   end
 
   local rel_path = M._current_rel_path()
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-
   if not rel_path then
     vim.notify("GHReview: cannot determine file path", vim.log.levels.ERROR)
     return
   end
 
+  if not start_line then
+    start_line = vim.api.nvim_win_get_cursor(0)[1]
+    end_line = start_line
+  elseif not end_line then
+    end_line = start_line
+  end
+
+  local range_label = start_line == end_line
+    and tostring(start_line)
+    or (start_line .. "-" .. end_line)
+
   require("gh-review.ui.comment_input").open({
-    title = "New Thread: " .. rel_path .. ":" .. cursor_line,
+    title = "New Thread: " .. rel_path .. ":" .. range_label,
     on_submit = function(body)
       vim.notify("GHReview: creating thread...", vim.log.levels.INFO)
-      graphql.create_thread(pr.node_id, rel_path, cursor_line, "RIGHT", body, function(err)
+      graphql.create_thread(pr.node_id, rel_path, end_line, "RIGHT", body, function(err)
         if err then
           vim.notify("GHReview: failed to create thread: " .. err, vim.log.levels.ERROR)
         else
           vim.notify("GHReview: thread created", vim.log.levels.INFO)
           M.refresh()
         end
-      end)
+      end, start_line)
     end,
   })
 end
@@ -661,7 +969,7 @@ function M._reply_to_thread(thread)
     context_lines = context_lines,
     on_submit = function(body)
       vim.notify("GHReview: posting reply...", vim.log.levels.INFO)
-      graphql.reply_to_thread(pr.node_id, thread.id, body, function(err)
+      graphql.reply_to_thread(thread.id, body, function(err)
         if err then
           vim.notify("GHReview: reply failed: " .. err, vim.log.levels.ERROR)
         else
@@ -858,6 +1166,7 @@ function M._current_rel_path()
   -- Check if we're in a ghreview:// buffer
   local review_path = filepath:match("^ghreview://base/(.+)$")
     or filepath:match("^ghreview://commit/[^/]+/(.+)$")
+    or filepath:match("^ghreview://unified/(.+)$")
   if review_path then return review_path end
   return filepath
 end
@@ -875,16 +1184,32 @@ function M._setup_keymaps()
   map(km.checkout, M.checkout_or_pick, "Checkout PR")
   map(km.review_current, M.review_current, "Review PR for current branch")
 
-  map(km.files, M.files, "Toggle file tree")
+  map(km.files, M.files, "Open/close file tree")
+  map(km.files_focus, M.files_focus, "Focus file tree")
   map(km.commits, M.commits_panel, "Toggle commits panel")
   map(km.comments, M.comments, "Toggle comments panel")
   map(km.reply, M.reply, "Reply to thread")
   map(km.new_thread, M.new_thread, "New comment thread")
+  -- Visual-mode variant: spans the selection as a multi-line thread.
+  vim.keymap.set("x", prefix .. km.new_thread, function()
+    local a = vim.fn.line("v")
+    local b = vim.fn.line(".")
+    local start_line = math.min(a, b)
+    local end_line = math.max(a, b)
+    -- Leave visual mode before we open the input window.
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
+    M.new_thread(start_line, end_line)
+  end, vim.tbl_extend("force", opts, { desc = "New multi-line comment thread" }))
   map(km.toggle_resolve, M.resolve, "Toggle resolve")
   map(km.hover, M.show_hover, "View comment at cursor")
   map(km.description, M.description, "PR description")
   map(km.toggle_overlay, M.toggle_overlay, "Toggle diff overlay")
   map(km.open_minidiff, M.open_minidiff, "Open file with diff overlay")
+  map(km.diffview, M.diffview, "Open diffview.nvim")
+  map(km.unified, M.open_unified, "Open unified single-buffer diff view")
+  map(km.ignore_whitespace, M.toggle_ignore_whitespace, "Toggle ignore whitespace-only changes")
+  map(km.toggle_linematch, M.toggle_linematch, "Toggle linematch (char highlights vs grouped blocks)")
+  map(km.toggle_view, M.toggle_view, "Toggle split / inline view")
   map(km.refresh, M.refresh, "Refresh PR data")
   map(km.close, M.close, "Close review")
 
@@ -895,6 +1220,10 @@ function M._setup_keymaps()
   -- ]d / [d cross-file diff hunk navigation
   vim.keymap.set("n", km.next_diff, M.next_diff, { desc = "Next diff hunk", silent = true })
   vim.keymap.set("n", km.prev_diff, M.prev_diff, { desc = "Prev diff hunk", silent = true })
+
+  -- Whole-file jumps across the PR (no-op when no PR review is active).
+  vim.keymap.set("n", km.next_file, M.next_file, { desc = "Next PR file", silent = true })
+  vim.keymap.set("n", km.prev_file, M.prev_file, { desc = "Prev PR file", silent = true })
 end
 
 return M

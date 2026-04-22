@@ -267,6 +267,98 @@ describe("diagnostics", function()
     end)
   end)
 
+  describe("BufEnter autocmd", function()
+    local orig_attach, orig_set_overlay, orig_get_pref, attach_calls, overlay_calls, pref
+
+    before_each(function()
+      local minidiff = require("gh-review.ui.minidiff")
+      orig_attach = minidiff.attach
+      orig_set_overlay = minidiff.set_overlay
+      orig_get_pref = minidiff.get_overlay_preference
+      attach_calls = {}
+      overlay_calls = {}
+      pref = true
+      minidiff.attach = function(buf)
+        table.insert(attach_calls, buf)
+        return true
+      end
+      minidiff.set_overlay = function(buf, enable)
+        table.insert(overlay_calls, { buf = buf, enable = enable })
+      end
+      minidiff.get_overlay_preference = function() return pref end
+    end)
+
+    after_each(function()
+      local minidiff = require("gh-review.ui.minidiff")
+      minidiff.attach = orig_attach
+      minidiff.set_overlay = orig_set_overlay
+      minidiff.get_overlay_preference = orig_get_pref
+    end)
+
+    it("applies overlay preference when attach succeeds", function()
+      state.set_pr({ number = 1, title = "t", base_ref = "main" })
+      pref = true
+
+      local buf = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_name(buf, vim.fn.getcwd() .. "/src/test.lua")
+      vim.bo[buf].buftype = ""
+
+      vim.api.nvim_set_current_buf(buf)
+      vim.wait(10)
+
+      assert.is_true(vim.tbl_contains(attach_calls, buf))
+      local found = false
+      for _, call in ipairs(overlay_calls) do
+        if call.buf == buf and call.enable == true then found = true end
+      end
+      assert.is_true(found)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("propagates an 'off' preference through to set_overlay", function()
+      state.set_pr({ number = 1, title = "t", base_ref = "main" })
+      pref = false
+
+      local buf = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_name(buf, vim.fn.getcwd() .. "/src/test.lua")
+      vim.bo[buf].buftype = ""
+
+      vim.api.nvim_set_current_buf(buf)
+      vim.wait(10)
+
+      local found_off = false
+      for _, call in ipairs(overlay_calls) do
+        if call.buf == buf and call.enable == false then found_off = true end
+      end
+      assert.is_true(found_off)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("skips set_overlay when attach reports failure (non-PR buffer)", function()
+      state.set_pr({ number = 1, title = "t", base_ref = "main" })
+      pref = true
+
+      local minidiff = require("gh-review.ui.minidiff")
+      minidiff.attach = function(buf)
+        table.insert(attach_calls, buf)
+        return false
+      end
+
+      local buf = vim.api.nvim_create_buf(false, false)
+      vim.api.nvim_buf_set_name(buf, vim.fn.getcwd() .. "/unrelated.txt")
+      vim.bo[buf].buftype = ""
+
+      vim.api.nvim_set_current_buf(buf)
+      vim.wait(10)
+
+      assert.are.equal(0, #overlay_calls)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+  end)
+
   describe("clear_all", function()
     it("removes all diagnostics", function()
       state.set_pr({ number = 1, title = "test", base_ref = "main" })

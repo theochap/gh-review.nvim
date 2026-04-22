@@ -119,7 +119,13 @@ function M.setup()
       if state.is_active() and should_have_diagnostics(args.buf) then
         M.refresh_buf(args.buf)
         if vim.bo[args.buf].buftype == "" then
-          require("gh-review.ui.minidiff").attach(args.buf)
+          local minidiff = require("gh-review.ui.minidiff")
+          -- Restore the overlay to whatever state the user last chose.
+          -- set_overlay is idempotent, so re-applying the same preference
+          -- on every BufEnter is cheap and means D doesn't need re-pressing.
+          if minidiff.attach(args.buf) then
+            minidiff.set_overlay(args.buf, minidiff.get_overlay_preference())
+          end
         end
       end
     end,

@@ -45,6 +45,7 @@ local M = {}
 ---@field title string
 ---@field author string
 ---@field base_ref string
+---@field base_sha? string Merge-base SHA; use this (not base_ref) when diffing to match GitHub's three-dot semantics
 ---@field head_ref string
 ---@field url string
 ---@field body string PR description markdown
@@ -61,6 +62,7 @@ local M = {}
 ---@field commits GHReviewCommit[]
 ---@field active_commit? GHReviewCommit
 ---@field commit_files GHReviewFile[]
+---@field view_mode? "split"|"inline" Current diff view mode; nil until a PR is loaded
 
 ---@type GHReviewState
 local state = {
@@ -73,6 +75,7 @@ local state = {
   commits = {},
   active_commit = nil,
   commit_files = {},
+  view_mode = nil,
 }
 
 function M.set_pr(pr)
@@ -264,6 +267,18 @@ function M.is_active()
   return state.active
 end
 
+--- Set the current diff view mode
+---@param mode "split"|"inline"
+function M.set_view_mode(mode)
+  state.view_mode = mode
+end
+
+--- Get the current diff view mode
+---@return "split"|"inline"|nil nil when no mode has been set this session
+function M.get_view_mode()
+  return state.view_mode
+end
+
 function M.clear()
   state.pr = nil
   state.files = {}
@@ -274,6 +289,7 @@ function M.clear()
   state.commits = {}
   state.active_commit = nil
   state.commit_files = {}
+  state.view_mode = nil
 end
 
 return M

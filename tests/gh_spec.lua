@@ -280,6 +280,10 @@ describe("gh", function()
       orig_system = stub_vim_system({
         { code = 0, stdout = "", stderr = "" },
       }, captured)
+      -- Force the non-jj branch so we only expect one vim.system call.
+      local util = require("gh-review.util")
+      local orig_find = util.find_jj_root
+      util.find_jj_root = function() return nil end
       gh = require("gh-review.gh")
 
       local result_err
@@ -289,9 +293,88 @@ describe("gh", function()
         done = true
       end)
       vim.wait(100, function() return done end)
+      util.find_jj_root = orig_find
 
       assert.is_nil(result_err)
+      assert.are.equal(1, #captured)
       assert.are.same({ "gh", "pr", "checkout", "123" }, captured[1].cmd)
+    end)
+
+    it("runs jj git import after checkout in a colocated jj repo", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = "", stderr = "" }, -- gh pr checkout
+        { code = 0, stdout = "", stderr = "" }, -- jj git import
+      }, captured)
+      local util = require("gh-review.util")
+      local orig_find = util.find_jj_root
+      util.find_jj_root = function() return "/fake/jj/root" end
+      gh = require("gh-review.gh")
+
+      local result_err
+      local done = false
+      gh.checkout(456, function(err)
+        result_err = err
+        done = true
+      end)
+      vim.wait(100, function() return done end)
+      util.find_jj_root = orig_find
+
+      assert.is_nil(result_err)
+      assert.are.equal(2, #captured)
+      assert.are.same({ "gh", "pr", "checkout", "456" }, captured[1].cmd)
+      assert.are.same({ "jj", "git", "import" }, captured[2].cmd)
+      assert.are.equal("/fake/jj/root", captured[2].opts.cwd)
+    end)
+
+    it("still completes when jj import fails (warns, does not error)", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = "", stderr = "" },               -- gh pr checkout
+        { code = 1, stdout = "", stderr = "import failed\n" },-- jj git import
+      }, captured)
+      local util = require("gh-review.util")
+      local orig_find = util.find_jj_root
+      util.find_jj_root = function() return "/fake/jj/root" end
+      gh = require("gh-review.gh")
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      local result_err
+      local done = false
+      gh.checkout(789, function(err)
+        result_err = err
+        done = true
+      end)
+      vim.wait(100, function() return done end)
+      util.find_jj_root = orig_find
+      vim.notify = orig_notify
+
+      assert.is_nil(result_err)
+      assert.is_true(#notifications >= 1)
+      local warned = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("jj git import failed") then warned = true end
+      end
+      assert.is_true(warned)
+    end)
+
+    it("propagates gh checkout error and skips jj import", function()
+      orig_system = stub_vim_system({
+        { code = 1, stdout = "", stderr = "pr not found\n" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local result_err
+      local done = false
+      gh.checkout(999, function(err)
+        result_err = err
+        done = true
+      end)
+      vim.wait(100, function() return done end)
+
+      assert.is_truthy(result_err and result_err:find("pr not found"))
+      assert.are.equal(1, #captured)
     end)
   end)
 

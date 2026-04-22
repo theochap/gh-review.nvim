@@ -31,6 +31,7 @@ describe("state", function()
       state.set_threads({ { id = "t1", path = "a.lua", mapped_line = 5 } })
       state.set_diff_text("diff content")
       state.set_pr_comments({ { author = "user", body = "hi" } })
+      state.set_view_mode("inline")
 
       state.clear()
 
@@ -40,6 +41,20 @@ describe("state", function()
       assert.are.same({}, state.get_pr_comments())
       assert.are.equal("", state.get_diff_text())
       assert.is_false(state.is_active())
+      assert.is_nil(state.get_view_mode())
+    end)
+  end)
+
+  describe("view_mode", function()
+    it("is nil until set", function()
+      assert.is_nil(state.get_view_mode())
+    end)
+
+    it("round-trips set/get", function()
+      state.set_view_mode("inline")
+      assert.are.equal("inline", state.get_view_mode())
+      state.set_view_mode("split")
+      assert.are.equal("split", state.get_view_mode())
     end)
   end)
 

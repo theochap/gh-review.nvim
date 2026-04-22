@@ -1,4 +1,6 @@
---- Scratch buffer for writing replies and new comment threads
+--- Scratch buffer for writing replies and new comment threads.
+--- Opens in a bottom horizontal split so the underlying diff stays visible
+--- while composing.
 local M = {}
 
 local config = require("gh-review.config")
@@ -12,49 +14,54 @@ function M.open(opts)
   vim.bo[buf].swapfile = false
 
   local cfg = config.get()
-  local width = math.min(80, cfg.float.max_width)
 
   -- Build initial content with optional context (e.g. thread being replied to)
   local input_start = 0
   if opts.context_lines and #opts.context_lines > 0 then
     local init_lines = vim.list_extend({}, opts.context_lines)
-    table.insert(init_lines, string.rep("─", width - 4))
+    table.insert(init_lines, string.rep("─", 72))
     table.insert(init_lines, "")
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, init_lines)
     input_start = #init_lines - 1 -- 0-indexed line of the empty input line
   end
 
+  -- Bottom split sized to fit context + a reasonable input area, capped by
+  -- config.float.max_height so very large replies don't dominate the screen.
   local context_height = input_start > 0 and math.min(input_start, 20) or 0
-  local height = math.min(15 + context_height, cfg.float.max_height)
+  local height = math.min(10 + context_height, cfg.float.max_height)
 
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    row = math.floor((vim.o.lines - height) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
-    width = width,
-    height = height,
-    style = "minimal",
-    border = cfg.float.border,
-    title = " " .. opts.title .. " ",
-    title_pos = "center",
-    footer = " Ctrl-S: submit | Esc Esc: cancel ",
-    footer_pos = "center",
-  })
+  vim.cmd("botright " .. height .. "split")
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, buf)
 
-  -- Enable word wrap
+  -- Window-local display polish
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  vim.wo[win].winfixheight = true
+  pcall(vim.api.nvim_buf_set_name, buf, "gh-review://compose/" .. opts.title)
 
   -- Highlight context lines as dimmed
   if input_start > 0 then
     local ns = vim.api.nvim_create_namespace("gh_review_input_ctx")
-    for i = 0, input_start - 1 do -- dim context lines and separator
+    for i = 0, input_start - 1 do
       vim.api.nvim_buf_add_highlight(buf, ns, "Comment", i, 0, -1)
     end
-    vim.api.nvim_win_set_cursor(win, { input_start + 1, 0 }) -- 1-indexed
+    vim.api.nvim_win_set_cursor(win, { input_start + 1, 0 })
   end
 
-  -- Start in insert mode
+  -- Header hint: title and keybind reminder as a one-line statusline-like
+  -- piece of virtual text on the first content row.
+  do
+    local ns = vim.api.nvim_create_namespace("gh_review_input_hint")
+    vim.api.nvim_buf_set_extmark(buf, ns, 0, 0, {
+      virt_text = { { opts.title .. "  (C-s submit · Esc Esc cancel)", "Title" } },
+      virt_text_pos = "right_align",
+    })
+  end
+
   vim.cmd("startinsert")
 
   local closed = false
@@ -69,7 +76,6 @@ function M.open(opts)
     end
   end
 
-  -- Submit: Ctrl-S
   for _, mode in ipairs({ "n", "i" }) do
     vim.keymap.set(mode, "<C-s>", function()
       local lines = vim.api.nvim_buf_get_lines(buf, input_start, -1, false)
@@ -83,7 +89,6 @@ function M.open(opts)
     end, { buffer = buf, nowait = true })
   end
 
-  -- Cancel: double Esc
   local esc_count = 0
   vim.keymap.set({ "n", "i" }, "<Esc>", function()
     esc_count = esc_count + 1
@@ -93,7 +98,6 @@ function M.open(opts)
         opts.on_cancel()
       end
     else
-      -- First Esc: exit insert mode if in insert, reset timer
       if vim.fn.mode() == "i" then
         vim.cmd("stopinsert")
       end

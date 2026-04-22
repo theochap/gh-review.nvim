@@ -15,7 +15,8 @@ function M.register()
     { prefix, group = "PR Review" },
     { prefix .. "o", desc = "Checkout PR" },
     { prefix .. "O", desc = "Review PR for current branch" },
-    { prefix .. "f", desc = "Toggle file tree" },
+    { prefix .. "f", desc = "Open/close file tree" },
+    { prefix .. "F", desc = "Focus file tree" },
     { prefix .. "c", desc = "Toggle comments panel" },
     { prefix .. "r", desc = "Reply to thread" },
     { prefix .. "n", desc = "New comment thread" },
@@ -24,10 +25,17 @@ function M.register()
     { prefix .. "d", desc = "PR description" },
     { prefix .. "D", desc = "Toggle diff overlay" },
     { prefix .. "e", desc = "Open file with diff overlay" },
+    { prefix .. "w", desc = "Open diffview.nvim" },
+    { prefix .. "u", desc = "Open unified single-buffer diff view" },
+    { prefix .. "W", desc = "Toggle ignore whitespace-only changes" },
+    { prefix .. "L", desc = "Toggle linematch (char vs grouped)" },
+    { prefix .. "V", desc = "Toggle split / inline view" },
     { prefix .. "R", desc = "Refresh PR data" },
     { prefix .. "q", desc = "Close review" },
     { "]d", desc = "Next diff hunk (cross-file)" },
     { "[d", desc = "Prev diff hunk (cross-file)" },
+    { "<leader>gN", desc = "Next PR file" },
+    { "<leader>gP", desc = "Prev PR file" },
   })
 end
 
