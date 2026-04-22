@@ -159,6 +159,23 @@ function M.focus()
   M.show()
 end
 
+--- Derive the PR-relative path of the current buffer, if any. Handles
+--- regular working-tree buffers and all ghreview:// scratch buffer names.
+---@param cwd string
+---@return string?
+local function current_pr_rel_path(cwd)
+  local name = vim.api.nvim_buf_get_name(0)
+  if name == "" then return nil end
+  local review = name:match("^ghreview://base/(.+)$")
+    or name:match("^ghreview://commit/[^/]+/(.+)$")
+    or name:match("^ghreview://unified/(.+)$")
+  if review then return review end
+  if name:sub(1, #cwd) == cwd then
+    return name:sub(#cwd + 2)
+  end
+  return nil
+end
+
 --- Show the changed files sidebar
 function M.show()
   local files = state.get_effective_files()
@@ -185,6 +202,20 @@ function M.show()
     title = title .. " (" .. active_commit.sha .. ")"
   end
 
+  -- Locate the item matching the current buffer so the picker opens with
+  -- the cursor already on it. Fall back to whatever snacks picks otherwise.
+  local current_rel = current_pr_rel_path(cwd)
+  local initial_idx
+  if current_rel then
+    local target = cwd .. "/" .. current_rel
+    for i, item in ipairs(items) do
+      if item.file == target then
+        initial_idx = i
+        break
+      end
+    end
+  end
+
   Snacks.picker.pick({
     source = "gh_review_files",
     title = title,
@@ -193,6 +224,9 @@ function M.show()
     layout = { preset = "sidebar", preview = false },
     auto_close = false,
     jump = { close = false },
+    on_show = initial_idx and function(picker)
+      pcall(function() picker.list:move(initial_idx, true) end)
+    end or nil,
     format = function(item, picker)
       local ret = fmt.tree(item, picker)
       if item._is_dir then
@@ -200,6 +234,10 @@ function M.show()
       else
         local file = item._file_data
         ret[#ret + 1] = { item._icon .. " ", item._hl }
+        if state.is_reviewed(file.path) then
+          local icon = config.get().icons.reviewed or "✓"
+          ret[#ret + 1] = { icon .. " ", "DiagnosticOk" }
+        end
         if file.status == "renamed" and file.old_path then
           local old_name = file.old_path:match("[^/]+$") or file.old_path
           ret[#ret + 1] = { old_name .. " → " .. item._name, item._hl }
@@ -211,6 +249,35 @@ function M.show()
       end
       return ret
     end,
+    actions = {
+      -- Toggle reviewed mark on the currently-selected file without leaving
+      -- the picker. Re-render in place so the ✓ appears immediately and
+      -- the cursor stays on the same file (picker:find resets to the top,
+      -- list:update({force=true}) + set_target preserves position).
+      gh_review_toggle_reviewed = function(picker)
+        local item = picker:current()
+        if not item or item._is_dir then return end
+        local file = item._file_data
+        if not file then return end
+        state.toggle_reviewed(file.path)
+        pcall(function()
+          picker.list:set_target(picker.list.cursor, picker.list.top, { force = true })
+          picker.list:update({ force = true })
+        end)
+      end,
+    },
+    win = {
+      list = {
+        keys = {
+          ["m"] = { "gh_review_toggle_reviewed", desc = "Toggle reviewed" },
+        },
+      },
+      input = {
+        keys = {
+          ["<a-m>"] = { "gh_review_toggle_reviewed", mode = { "n", "i" }, desc = "Toggle reviewed" },
+        },
+      },
+    },
     confirm = function(picker, item)
       if not item or item._is_dir then return end
       local file = item._file_data

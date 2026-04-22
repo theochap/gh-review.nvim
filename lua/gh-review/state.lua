@@ -63,6 +63,7 @@ local M = {}
 ---@field active_commit? GHReviewCommit
 ---@field commit_files GHReviewFile[]
 ---@field view_mode? "split"|"inline" Current diff view mode; nil until a PR is loaded
+---@field reviewed table<string, true> Set of file paths the user has manually marked as reviewed
 
 ---@type GHReviewState
 local state = {
@@ -76,11 +77,23 @@ local state = {
   active_commit = nil,
   commit_files = {},
   view_mode = nil,
+  reviewed = {},
 }
 
 function M.set_pr(pr)
   state.pr = pr
   state.active = true
+
+  -- Load persisted reviewed marks for this PR (no-op for PRs without
+  -- owner/number info, which is the common case in unit tests).
+  state.reviewed = {}
+  local store = require("gh-review.reviewed_store")
+  local key = store.key_for(pr)
+  if key then
+    for _, path in ipairs(store.load(key)) do
+      state.reviewed[path] = true
+    end
+  end
 end
 
 function M.get_pr()
@@ -267,6 +280,55 @@ function M.is_active()
   return state.active
 end
 
+--- Persist the current reviewed set to disk, if a PR key is available.
+local function persist_reviewed()
+  local store = require("gh-review.reviewed_store")
+  local key = store.key_for(state.pr)
+  if not key then return end
+  local paths = {}
+  for p in pairs(state.reviewed) do table.insert(paths, p) end
+  pcall(store.save, key, paths)
+end
+
+--- Mark or unmark a file as reviewed.
+---@param path string PR-relative path
+---@param value boolean
+function M.set_reviewed(path, value)
+  state.reviewed[path] = value and true or nil
+  persist_reviewed()
+end
+
+--- Toggle a file's reviewed state and return the new state.
+---@param path string
+---@return boolean is_now_reviewed
+function M.toggle_reviewed(path)
+  if state.reviewed[path] then
+    state.reviewed[path] = nil
+    persist_reviewed()
+    return false
+  end
+  state.reviewed[path] = true
+  persist_reviewed()
+  return true
+end
+
+--- Whether a file is marked as reviewed.
+---@param path string
+---@return boolean
+function M.is_reviewed(path)
+  return state.reviewed[path] == true
+end
+
+--- Get an unordered list of paths marked as reviewed.
+---@return string[]
+function M.get_reviewed_files()
+  local list = {}
+  for p in pairs(state.reviewed) do
+    table.insert(list, p)
+  end
+  return list
+end
+
 --- Set the current diff view mode
 ---@param mode "split"|"inline"
 function M.set_view_mode(mode)
@@ -290,6 +352,7 @@ function M.clear()
   state.active_commit = nil
   state.commit_files = {}
   state.view_mode = nil
+  state.reviewed = {}
 end
 
 return M

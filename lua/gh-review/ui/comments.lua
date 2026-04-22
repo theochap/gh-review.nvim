@@ -3,6 +3,69 @@ local M = {}
 
 local config = require("gh-review.config")
 local util = require("gh-review.util")
+local state = require("gh-review.state")
+local diff_module = require("gh-review.diff")
+
+--- Build the exact slice of diff lines that a thread points to, with
+--- per-row highlight hints. Only the lines inside the commented range are
+--- emitted — surrounding hunk context is omitted. Returns two parallel
+--- arrays: rendered lines (with original `+`/`-`/` ` prefix preserved) and
+--- a row→hl_group map for DiffAdd/DiffDelete.
+---@param thread table GHReviewThread
+---@return string[] lines
+---@return table<number, string> highlights
+local function build_diff_context(thread)
+  local diff_text = state.get_diff_text()
+  if not diff_text or diff_text == "" then return {}, {} end
+
+  local files = diff_module.parse(diff_text)
+  local file_diff = files[thread.path]
+  if not file_diff then return {}, {} end
+
+  local side = thread.side or "RIGHT"
+  local target_end = thread.line
+  if not target_end then return {}, {} end
+  local target_start = thread.start_line or target_end
+
+  local out_lines = {}
+  local out_hl = {}
+
+  for _, hunk in ipairs(file_diff.hunks) do
+    local old_line = hunk.old_start
+    local new_line = hunk.new_start
+
+    for _, l in ipairs(hunk.lines) do
+      local prefix = l:sub(1, 1)
+      local take = false
+      if side == "RIGHT" and (prefix == " " or prefix == "+") then
+        take = new_line >= target_start and new_line <= target_end
+      elseif side == "LEFT" and (prefix == " " or prefix == "-") then
+        take = old_line >= target_start and old_line <= target_end
+      end
+      if take then
+        table.insert(out_lines, l)
+        if prefix == "-" then
+          out_hl[#out_lines] = "DiffDelete"
+        elseif prefix == "+" then
+          out_hl[#out_lines] = "DiffAdd"
+        end
+      end
+
+      if prefix == "-" then
+        old_line = old_line + 1
+      elseif prefix == "+" then
+        new_line = new_line + 1
+      else
+        old_line = old_line + 1
+        new_line = new_line + 1
+      end
+    end
+
+    if #out_lines > 0 then return out_lines, out_hl end
+  end
+
+  return {}, {}
+end
 
 --- Show a single thread in a floating window
 ---@param thread table GHReviewThread
@@ -16,8 +79,27 @@ function M.show_thread(thread, opts)
   local status = thread.is_resolved and " [RESOLVED]" or ""
   table.insert(lines, "── Thread" .. status .. " ──")
   table.insert(highlights, { line = #lines, hl = "Title" })
-  table.insert(lines, "File: " .. thread.path .. ":" .. (thread.mapped_line or thread.line or "?"))
+  local loc = thread.path
+  if thread.start_line and thread.line and thread.start_line ~= thread.line then
+    loc = loc .. ":" .. thread.start_line .. "-" .. thread.line
+  else
+    loc = loc .. ":" .. (thread.line or thread.mapped_line or "?")
+  end
+  table.insert(lines, "File: " .. loc)
   table.insert(lines, "")
+
+  -- Diff context: the hunk the comment points to, with a ▶ marker on the
+  -- exact line(s) being discussed.
+  local diff_lines, diff_hl = build_diff_context(thread)
+  if #diff_lines > 0 then
+    for i, dl in ipairs(diff_lines) do
+      table.insert(lines, dl)
+      if diff_hl[i] then
+        table.insert(highlights, { line = #lines, hl = diff_hl[i] })
+      end
+    end
+    table.insert(lines, "")
+  end
 
   -- Comments
   for i, comment in ipairs(thread.comments) do

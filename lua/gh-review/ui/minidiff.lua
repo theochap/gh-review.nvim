@@ -97,6 +97,21 @@ function M.get_overlay_preference()
   return overlay_preference
 end
 
+--- Apply the overlay preference to a buffer the first time we see it.
+--- Subsequent BufEnter events (e.g. exiting a floating window back to this
+--- buffer) are no-ops, so a state the user explicitly changed (pressing D
+--- to turn off, for example) isn't forcibly reset by the autocmd.
+--- Uses a buffer-local variable so the flag is scoped to the buffer and
+--- cleaned up automatically when the buffer is wiped.
+---@param buf number
+function M.apply_overlay_on_first_entry(buf)
+  if vim.b[buf].gh_review_overlay_initialized then return end
+  vim.b[buf].gh_review_overlay_initialized = true
+  if overlay_preference then
+    M.set_overlay(buf, true)
+  end
+end
+
 --- Toggle overlay on current buffer. Flips the session preference so future
 --- files follow suit.
 function M.toggle_overlay()
@@ -137,6 +152,7 @@ function M.detach_all()
     if vim.api.nvim_buf_is_valid(buf) then
       pcall(MiniDiff.disable, buf)
       vim.b[buf].minidiff_config = nil
+      vim.b[buf].gh_review_overlay_initialized = nil
     end
   end
   ref_cache = {}

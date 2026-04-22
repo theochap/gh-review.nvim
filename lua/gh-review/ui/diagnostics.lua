@@ -120,11 +120,12 @@ function M.setup()
         M.refresh_buf(args.buf)
         if vim.bo[args.buf].buftype == "" then
           local minidiff = require("gh-review.ui.minidiff")
-          -- Restore the overlay to whatever state the user last chose.
-          -- set_overlay is idempotent, so re-applying the same preference
-          -- on every BufEnter is cheap and means D doesn't need re-pressing.
+          -- Apply the overlay preference only the first time we enter this
+          -- buffer. Re-entering (e.g. closing a floating hover and coming
+          -- back) must not force-reset the overlay state — users expect a
+          -- manual D toggle to stick across window focus changes.
           if minidiff.attach(args.buf) then
-            minidiff.set_overlay(args.buf, minidiff.get_overlay_preference())
+            minidiff.apply_overlay_on_first_entry(args.buf)
           end
         end
       end

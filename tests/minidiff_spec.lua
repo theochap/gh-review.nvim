@@ -504,6 +504,86 @@ describe("minidiff", function()
     end)
   end)
 
+  describe("apply_overlay_on_first_entry", function()
+    it("applies preference once, then is a no-op on re-entry", function()
+      state.set_pr({ number = 1, title = "t", base_ref = "main" })
+      state.set_files({ { path = "src/first.lua", status = "modified" } })
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, vim.fn.getcwd() .. "/src/first.lua")
+
+      local orig_system = vim.system
+      vim.system = function(cmd, opts)
+        if cmd[1] == "git" and cmd[2] == "show" then
+          return { wait = function() return { code = 0, stdout = "x\n" } end }
+        end
+        return orig_system(cmd, opts)
+      end
+
+      -- Seed preference=true and initialize via a first apply
+      minidiff.attach(buf)
+      minidiff.set_overlay(buf, true)
+      minidiff.apply_overlay_on_first_entry(buf) -- first call: marks initialized
+      assert.is_true(vim.b[buf].gh_review_overlay_initialized == true)
+
+      -- User manually flips overlay off outside our plugin
+      pcall(require("mini.diff").toggle_overlay, buf)
+      assert.is_false(require("mini.diff").get_buf_data(buf).overlay)
+
+      -- Second apply_overlay_on_first_entry must NOT re-enable overlay
+      minidiff_calls = {}
+      minidiff.apply_overlay_on_first_entry(buf)
+      local toggled = false
+      for _, c in ipairs(minidiff_calls) do
+        if c.fn == "toggle_overlay" then toggled = true end
+      end
+      assert.is_false(toggled)
+      assert.is_false(require("mini.diff").get_buf_data(buf).overlay)
+
+      vim.system = orig_system
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("enables overlay on a fresh buffer when preference is true", function()
+      state.set_pr({ number = 1, title = "t", base_ref = "main" })
+      state.set_files({
+        { path = "src/seed.lua", status = "modified" },
+        { path = "src/fresh.lua", status = "modified" },
+      })
+
+      local orig_system = vim.system
+      vim.system = function(cmd, opts)
+        if cmd[1] == "git" and cmd[2] == "show" then
+          return { wait = function() return { code = 0, stdout = "x\n" } end }
+        end
+        return orig_system(cmd, opts)
+      end
+
+      -- Seed preference=true via a prior buffer
+      local seed = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(seed, vim.fn.getcwd() .. "/src/seed.lua")
+      minidiff.attach(seed)
+      minidiff.set_overlay(seed, true)
+
+      -- Fresh buffer: first entry should enable overlay
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, vim.fn.getcwd() .. "/src/fresh.lua")
+      minidiff.attach(buf)
+      minidiff_calls = {}
+      minidiff.apply_overlay_on_first_entry(buf)
+
+      local toggled = false
+      for _, c in ipairs(minidiff_calls) do
+        if c.fn == "toggle_overlay" and c.buf == buf then toggled = true end
+      end
+      assert.is_true(toggled)
+
+      vim.system = orig_system
+      vim.api.nvim_buf_delete(buf, { force = true })
+      vim.api.nvim_buf_delete(seed, { force = true })
+    end)
+  end)
+
   describe("detach_all", function()
     it("calls disable and clears buffer config", function()
       state.set_pr({ number = 1, title = "test", base_ref = "main" })
