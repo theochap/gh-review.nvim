@@ -90,6 +90,58 @@ describe("diff_review", function()
       assert.is_false(diff_review.is_diff_active())
     end)
 
+    it("uses base_sha (merge base) instead of base_ref when available", function()
+      state.set_pr({
+        number = 42, title = "Test", author = "dev", base_ref = "main", base_sha = "mergebase123",
+        head_ref = "feature", url = "", body = "", review_decision = "", repository = "org/repo",
+      })
+
+      local captured_ref = nil
+      local orig_git_show = util.git_show_lines
+      util.git_show_lines = function(ref)
+        captured_ref = ref
+        return { "base" }
+      end
+
+      local cwd = vim.fn.getcwd()
+      local test_file = cwd .. "/test_base_sha_temp.lua"
+      vim.fn.writefile({ "work" }, test_file)
+
+      diff_review.open("test_base_sha_temp.lua")
+
+      assert.are.equal("mergebase123:test_base_sha_temp.lua", captured_ref)
+
+      diff_review.close()
+      util.git_show_lines = orig_git_show
+      vim.fn.delete(test_file)
+    end)
+
+    it("falls back to base_ref when base_sha is absent", function()
+      state.set_pr({
+        number = 42, title = "Test", author = "dev", base_ref = "main",
+        head_ref = "feature", url = "", body = "", review_decision = "", repository = "org/repo",
+      })
+
+      local captured_ref = nil
+      local orig_git_show = util.git_show_lines
+      util.git_show_lines = function(ref)
+        captured_ref = ref
+        return { "base" }
+      end
+
+      local cwd = vim.fn.getcwd()
+      local test_file = cwd .. "/test_base_ref_temp.lua"
+      vim.fn.writefile({ "work" }, test_file)
+
+      diff_review.open("test_base_ref_temp.lua")
+
+      assert.are.equal("main:test_base_ref_temp.lua", captured_ref)
+
+      diff_review.close()
+      util.git_show_lines = orig_git_show
+      vim.fn.delete(test_file)
+    end)
+
     it("opens commit diff with scratch buffers", function()
       state.set_pr({
         number = 42, title = "Test", author = "dev", base_ref = "main",

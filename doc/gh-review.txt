@@ -74,11 +74,14 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
 
   require("gh-review").setup({
     gh_cmd = "gh",                  -- path to gh CLI
+    default_view_mode = "inline",   -- "split" or "inline"
+    default_ignore_whitespace = true,  -- hide whitespace-only hunks by default
     keymaps = {
       prefix = "<leader>gp",       -- keymap prefix
       checkout = "o",
       review_current = "O",
       files = "f",
+      files_focus = "F",
       comments = "c",
       reply = "r",
       new_thread = "n",
@@ -87,6 +90,11 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
       description = "d",
       toggle_overlay = "D",
       open_minidiff = "e",
+      diffview = "w",
+      unified = "u",
+      ignore_whitespace = "W",
+      toggle_linematch = "L",
+      toggle_view = "V",
       refresh = "R",
       close = "q",
       next_comment = "]c",
@@ -94,6 +102,8 @@ Call `require("gh-review").setup(opts)` with any of these options: >lua
       commits = "C",
       next_diff = "]d",
       prev_diff = "[d",
+      next_file = "<leader>gN",
+      prev_file = "<leader>gP",
     },
     icons = {
       added = "A",
@@ -137,9 +147,11 @@ A typical review session:
      without switching branches.
 
 2. Browse changed files~
-   - `<leader>gpf` opens the file tree sidebar. Directories with a single
-     child are collapsed (e.g. `a/b/c`). Renamed files display as
-     `old_name → new_name`. Each file shows status icon and +/- stats.
+   - `<leader>gpf` opens or closes the file tree sidebar (strict two-state
+     toggle). `<leader>gpF` focuses it instead, opening it if closed.
+     Directories with a single child are collapsed (e.g. `a/b/c`). Renamed
+     files display as `old_name → new_name`. Each file shows status icon
+     and +/- stats.
    - Press `<cr>` on a file to open a diff split.
 
 3. View diffs~
@@ -160,6 +172,9 @@ A typical review session:
 5. Navigate diff hunks~
    - `]d` / `[d` jump to the next/previous diff hunk, crossing file
      boundaries.
+   - `<leader>gN` / `<leader>gP` jump to the next/previous file in the PR
+     (whole-file jumps, regardless of hunk position). Silent no-op when no
+     review is active.
 
 6. View and reply to comments~
    - `<leader>gpv` shows the comment thread at or near cursor (within 3
@@ -200,8 +215,8 @@ A typical review session:
   No PR number is needed — uses `gh pr view` for the current branch.
 
 :GHReview files                          *:GHReview-files*
-  Toggle file tree sidebar showing changed files. Directories with a single
-  child are collapsed. Renamed files show `old → new`. Requires snacks.nvim.
+  Open or close the file tree sidebar. Directories with a single child are
+  collapsed. Renamed files show `old → new`. Requires snacks.nvim.
 
 :GHReview comments                       *:GHReview-comments*
   Toggle bottom panel showing all review comment threads
@@ -230,7 +245,8 @@ Normal mode:~
 
   `<leader>gpo`   Checkout PR (opens fuzzy picker, or prompts if no snacks)
   `<leader>gpO`   Review PR for current branch (no checkout needed)
-  `<leader>gpf`   Toggle file tree sidebar
+  `<leader>gpf`   Open or close file tree sidebar
+  `<leader>gpF`   Focus file tree sidebar (opens it if closed)
   `<leader>gpC`   Toggle commits sidebar (select to filter by commit)
   `<leader>gpc`   Toggle comments panel (trouble.nvim)
   `<leader>gpr`   Reply to thread at/near cursor
@@ -240,12 +256,19 @@ Normal mode:~
   `<leader>gpd`   PR description page
   `<leader>gpD`   Toggle mini.diff inline overlay
   `<leader>gpe`   Open file with mini.diff overlay (close split)
+  `<leader>gpw`   Open diffview.nvim for the active PR
+  `<leader>gpu`   Open unified single-buffer diff view of current file
+  `<leader>gpW`   Toggle ignore-whitespace-only changes (all views)
+  `<leader>gpL`   Toggle linematch (char highlights vs grouped blocks)
+  `<leader>gpV`   Toggle split / inline view for current file
   `<leader>gpR`   Refresh PR data
   `<leader>gpq`   Close review session
   `]c`            Next comment (falls through to gitsigns if no review)
   `[c`            Previous comment
   `]d`            Next diff hunk (crosses file boundaries)
   `[d`            Previous diff hunk (crosses file boundaries)
+  `<leader>gN`    Next PR file (silent no-op outside review mode)
+  `<leader>gP`    Previous PR file (silent no-op outside review mode)
 
 Buffer-local keymaps:~
 
@@ -274,14 +297,34 @@ Displays `⎇ #1234 head_ref ✓` when a review is active. When filtering by
 commit, appends `@ abc1234 commit message` (message truncated to 30 chars).
 
 Diff Review~
-Comment navigation (picker selection, `]c`/`[c`, comment threads) and the
-files picker open a native Neovim diff split: the working file on the right
-(modifiable) and the base version (`git show <base_ref>:<path>`) on the
-left (readonly scratch buffer). Both windows use `:diffthis` for built-in
-diff highlighting, folds, and scrollbind.
+Two view modes are available:
 
-When filtering by commit, the diff shows the commit's parent on the left and
-the commit version on the right. Both sides are readonly in commit mode.
+  Inline (default) single buffer with mini.diff overlay (virtual text for
+                   deletions, gutter signs for additions).
+  Split            side-by-side base vs working buffers with `:diffthis`.
+
+Set the default via `default_view_mode = "split"|"inline"`. Press
+`<leader>gpV` to switch modes for the current file at any time — the choice
+persists across file navigation until the review session ends.
+
+The base side uses the merge-base commit between the PR's base branch and
+HEAD (three-dot semantics), matching GitHub's diff view. When filtering by
+commit, the base side is the commit's parent.
+
+Split mode details~
+Working file on the right (modifiable), base version (`git show <sha>:<path>`)
+on the left (readonly scratch buffer). Both windows use `:diffthis` for
+built-in diff highlighting, folds, and scrollbind. When filtering by commit,
+both sides are readonly.
+
+Inline mode details~
+Requires mini.diff. In full-PR mode the working-tree file is opened and
+mini.diff's reference text is set to the base version. In commit-scoped
+mode, a readonly `ghreview://commit/<sha>/<path>` scratch buffer holds the
+commit version and the reference is the parent version.
+
+Inline mode is not available for deleted files; the plugin transparently
+falls back to split view and notifies.
 
 All comment threads for the file are rendered as virtual lines (extmarks)
 below their respective lines on the right buffer. The focused thread is
@@ -318,9 +361,61 @@ all comment threads as diagnostics-style items. Buffer-local keymaps in the
 trouble window: `r` reply, `t` toggle resolve, `v` view thread float,
 `<cr>` jump to the diff location.
 
+Unified view (VS Code-like)~
+`<leader>gpu` opens a read-only synthetic buffer `ghreview://unified/<path>`
+that shows every hunk of the current PR file inline. Each hunk begins with
+a `@@ -old,count +new,count @@` header; context lines appear in normal
+foreground; deletions get a full-line `DiffDelete` background and appear as
+a contiguous block above the additions, which get `DiffAdd`. Filetype is
+detected from the path so syntax highlighting still applies on top of the
+diff backgrounds. The cursor is positioned near the working-tree line you
+were on, if that line is part of the diff.
+
+This is a lightweight MVP — no dual line-number gutter, no comment markers
+in this view yet, no LSP attach. Use `<leader>gpV` to return to split or
+inline when you need those integrations.
+
+Toggling linematch~
+Neovim's diff `linematch` setting controls two bundled behaviours: it pairs
+matching `-`/`+` lines across the two sides (producing the interleaved
+display) and enables `DiffText` character-level highlights within those
+paired lines. Press `<leader>gpL` to toggle it off for the session —
+deletions and additions render as two grouped blocks with no character
+highlights. Press again to restore the default.
+
+The toggle affects all views the plugin exposes. `:diffopt` loses the
+`linematch:N` entry (split + diffview inherit it); mini.diff's inline
+view sees the same via a scoped `vim.diff` wrapper. The original
+`linematch:N` value is remembered and re-added on restore.
+
+Ignoring whitespace-only changes~
+Press `<leader>gpW` (or call `:lua require('gh-review').toggle_ignore_whitespace()`)
+to hide hunks that differ only in whitespace/blank lines. The toggle
+affects every view the plugin exposes:
+
+- Native split and diffview.nvim pick it up through 'diffopt'
+  (`iwhiteall,iblank` appended while active).
+- mini.diff's inline view picks it up through a scoped wrapper around
+  `vim.diff` that injects `ignore_whitespace = true` while active.
+
+The preference is restored when the review session closes.
+
+Jujutsu (jj) repositories~
+Colocated jj repositories (a `.jj` directory alongside `.git`) are supported.
+After `gh pr checkout`, the plugin runs `jj git import` to sync jj's view of
+the new branch and HEAD. All read-only git queries used by the plugin
+(`git show`, `git merge-base`, `git diff-tree`) work transparently on
+colocated jj, so no further configuration is needed.
+
+If `jj git import` fails, a warning is shown but the review still proceeds;
+the checkout itself has already succeeded at the git level.
+
 Diffview (optional)~
-If diffview.nvim is installed, you can still open it manually for a full
-PR overview. It is no longer used for comment navigation.
+If diffview.nvim is installed, press `<leader>gpw` (or call
+`:lua require('gh-review').diffview()`) to open it for the active PR's
+`<base>...HEAD` range. The diff base matches GitHub's three-dot view and the
+`linematch` entries in 'diffopt' are stripped for the session so consecutive
+-/+ lines appear as grouped blocks. It is not used for comment navigation.
 
 Which-key~
 The `<leader>gp` group is automatically registered if which-key is installed.

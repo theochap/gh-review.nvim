@@ -118,15 +118,13 @@ function M.fetch_threads(owner, repo, pr_number, callback)
 end
 
 --- Reply to an existing review thread
----@param pr_id string PR node ID (not number)
 ---@param thread_id string Thread node ID
 ---@param body string Reply body
 ---@param callback fun(err: string?)
-function M.reply_to_thread(pr_id, thread_id, body, callback)
+function M.reply_to_thread(thread_id, body, callback)
   local query = [[
-    mutation($prId: ID!, $threadId: ID!, $body: String!) {
-      addPullRequestReviewComment(input: {
-        pullRequestId: $prId,
+    mutation($threadId: ID!, $body: String!) {
+      addPullRequestReviewThreadReply(input: {
         pullRequestReviewThreadId: $threadId,
         body: $body
       }) {
@@ -134,39 +132,63 @@ function M.reply_to_thread(pr_id, thread_id, body, callback)
       }
     }
   ]]
-  gh.graphql(query, { prId = pr_id, threadId = thread_id, body = body }, function(err, _)
+  gh.graphql(query, { threadId = thread_id, body = body }, function(err, _)
     callback(err)
   end)
 end
 
---- Create a new review thread
+--- Create a new review thread. For multi-line threads pass `start_line`
+--- (the topmost selected line); GitHub treats the pair as a range comment.
 ---@param pr_id string PR node ID
 ---@param path string File path
----@param line number Line number
+---@param line number End line of the range (or the single commented line)
 ---@param side string "LEFT" or "RIGHT"
 ---@param body string Comment body
 ---@param callback fun(err: string?)
-function M.create_thread(pr_id, path, line, side, body, callback)
-  local query = [[
-    mutation($prId: ID!, $path: String!, $line: Int!, $side: DiffSide!, $body: String!) {
-      addPullRequestReviewThread(input: {
-        pullRequestId: $prId,
-        path: $path,
-        line: $line,
-        side: $side,
-        body: $body
-      }) {
-        thread { id }
-      }
-    }
-  ]]
-  gh.graphql(query, {
+---@param start_line? number First line of the range; omit/equal-to-line for single-line
+function M.create_thread(pr_id, path, line, side, body, callback, start_line)
+  local is_multi = type(start_line) == "number" and start_line ~= line
+  local query
+  local vars = {
     prId = pr_id,
     path = path,
     line = line,
     side = side,
     body = body,
-  }, function(err, _)
+  }
+  if is_multi then
+    query = [[
+      mutation($prId: ID!, $path: String!, $line: Int!, $startLine: Int!, $side: DiffSide!, $body: String!) {
+        addPullRequestReviewThread(input: {
+          pullRequestId: $prId,
+          path: $path,
+          line: $line,
+          startLine: $startLine,
+          startSide: $side,
+          side: $side,
+          body: $body
+        }) {
+          thread { id }
+        }
+      }
+    ]]
+    vars.startLine = start_line
+  else
+    query = [[
+      mutation($prId: ID!, $path: String!, $line: Int!, $side: DiffSide!, $body: String!) {
+        addPullRequestReviewThread(input: {
+          pullRequestId: $prId,
+          path: $path,
+          line: $line,
+          side: $side,
+          body: $body
+        }) {
+          thread { id }
+        }
+      }
+    ]]
+  end
+  gh.graphql(query, vars, function(err, _)
     callback(err)
   end)
 end

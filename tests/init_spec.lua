@@ -75,16 +75,23 @@ local function make_pr_comments()
 end
 
 describe("init", function()
-  local gh, graphql, diagnostics, init
+  local gh, graphql, diagnostics, init, util
+  local orig_git_merge_base
 
   before_each(function()
     config.setup()
     state.clear()
 
+    -- Stub util.git_merge_base so _load_pr_data doesn't shell out to git during tests
+    util = require("gh-review.util")
+    orig_git_merge_base = util.git_merge_base
+    util.git_merge_base = function() return "merge_base_sha" end
+
     -- Stub diagnostics before requiring init
     package.loaded["gh-review.ui.diagnostics"] = {
       setup = function() end,
       refresh_all = function() end,
+      refresh_buf = function() end,
       clear_all = function() end,
     }
     diagnostics = package.loaded["gh-review.ui.diagnostics"]
@@ -105,7 +112,8 @@ describe("init", function()
 
     -- Stub files UI
     package.loaded["gh-review.ui.files"] = {
-      toggle = function() end,
+      open_or_close = function() end,
+      focus = function() end,
       show = function() end,
     }
 
@@ -137,6 +145,7 @@ describe("init", function()
 
   after_each(function()
     state.clear()
+    util.git_merge_base = orig_git_merge_base
     -- Clean up stubs
     package.loaded["gh-review.ui.diagnostics"] = nil
     package.loaded["gh-review.integrations.which_key"] = nil
@@ -193,6 +202,7 @@ describe("init", function()
       assert.are.equal("Test PR", pr.title)
       assert.are.equal("testuser", pr.author)
       assert.are.equal("main", pr.base_ref)
+      assert.are.equal("merge_base_sha", pr.base_sha)
       assert.are.equal("feature-branch", pr.head_ref)
       assert.are.equal("org/repo", pr.repository)
       assert.are.equal("PR_NODE_ID_123", pr.node_id)
@@ -1093,19 +1103,34 @@ describe("init", function()
       assert.is_truthy(notifications[1].msg:find("no active review"))
     end)
 
-    it("files() calls toggle when active", function()
+    it("files() calls open_or_close when active", function()
       state.set_pr({
         number = 42, title = "T", author = "a", base_ref = "m",
         head_ref = "f", url = "", body = "", review_decision = "", repository = "o/r",
       })
 
-      local toggle_called = false
+      local called = false
       local files_ui = package.loaded["gh-review.ui.files"]
-      files_ui.toggle = function() toggle_called = true end
+      files_ui.open_or_close = function() called = true end
 
       init.files()
 
-      assert.is_true(toggle_called)
+      assert.is_true(called)
+    end)
+
+    it("files_focus() calls focus when active", function()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m",
+        head_ref = "f", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+
+      local called = false
+      local files_ui = package.loaded["gh-review.ui.files"]
+      files_ui.focus = function() called = true end
+
+      init.files_focus()
+
+      assert.is_true(called)
     end)
   end)
 
@@ -1399,6 +1424,372 @@ describe("init", function()
 
       vim.notify = orig_notify
       assert.is_truthy(notifications[1].msg:find("no active review"))
+    end)
+  end)
+
+  describe("_open_file", function()
+    local diff_review_calls, minidiff_calls
+
+    local function cleanup_test_buffers()
+      local cwd = vim.fn.getcwd()
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+          local name = vim.api.nvim_buf_get_name(buf)
+          if name == cwd .. "/src/a.lua" or name:find("^ghreview://") then
+            pcall(vim.api.nvim_buf_delete, buf, { force = true })
+          end
+        end
+      end
+    end
+
+    before_each(function()
+      cleanup_test_buffers()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "main", base_sha = "base123",
+        head_ref = "f", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+      state.set_files({
+        { path = "src/a.lua", status = "modified", additions = 1, deletions = 0 },
+        { path = "src/gone.lua", status = "deleted", additions = 0, deletions = 10 },
+      })
+
+      diff_review_calls = {}
+      minidiff_calls = {}
+
+      package.loaded["gh-review.ui.diff_review"] = {
+        get_file_path = function() return nil end,
+        close = function() table.insert(diff_review_calls, { fn = "close" }) end,
+        open = function(path, line)
+          table.insert(diff_review_calls, { fn = "open", path = path, line = line })
+        end,
+        is_diff_active = function() return false end,
+        get_work_win = function() return nil end,
+      }
+      package.loaded["gh-review.ui.minidiff"] = {
+        attach = function(buf, opts)
+          table.insert(minidiff_calls, { fn = "attach", buf = buf, opts = opts })
+        end,
+        set_overlay = function(buf, enable)
+          table.insert(minidiff_calls, { fn = "set_overlay", buf = buf, enable = enable })
+        end,
+        detach_all = function() end,
+      }
+    end)
+
+    after_each(cleanup_test_buffers)
+
+    it("calls diff_review.open in split mode", function()
+      state.set_view_mode("split")
+      init._open_file("src/a.lua", 5)
+
+      local found = false
+      for _, c in ipairs(diff_review_calls) do
+        if c.fn == "open" and c.path == "src/a.lua" and c.line == 5 then
+          found = true
+        end
+      end
+      assert.is_true(found)
+    end)
+
+    it("opens an inline overlay in inline mode", function()
+      state.set_view_mode("inline")
+
+      local cwd = vim.fn.getcwd()
+      local test_file = cwd .. "/src/a.lua"
+      vim.fn.mkdir(cwd .. "/src", "p")
+      vim.fn.writefile({ "line1", "line2" }, test_file)
+
+      init._open_file("src/a.lua", 1)
+
+      local attached, overlay_on = false, false
+      for _, c in ipairs(minidiff_calls) do
+        if c.fn == "attach" then
+          attached = true
+          assert.are.equal("src/a.lua", c.opts and c.opts.rel_path)
+        end
+        if c.fn == "set_overlay" and c.enable == true then
+          overlay_on = true
+        end
+      end
+      assert.is_true(attached)
+      assert.is_true(overlay_on)
+
+      vim.fn.delete(test_file)
+      vim.fn.delete(cwd .. "/src", "d")
+    end)
+
+    it("falls back to split with notify when inline requested for deleted file", function()
+      state.set_view_mode("inline")
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init._open_file("src/gone.lua", 1)
+
+      vim.notify = orig_notify
+
+      local opened_split = false
+      for _, c in ipairs(diff_review_calls) do
+        if c.fn == "open" and c.path == "src/gone.lua" then opened_split = true end
+      end
+      assert.is_true(opened_split)
+
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("inline view unavailable for deleted files") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("uses a scratch buffer for inline view of a commit-scoped file", function()
+      state.set_view_mode("inline")
+      state.set_active_commit({ sha = "abc12345", oid = "abc12345full", message = "m", author = "d" })
+      state.set_commit_files({ { path = "src/a.lua", status = "modified", additions = 1, deletions = 0 } })
+
+      local util = require("gh-review.util")
+      local orig_git_show = util.git_show_lines
+      util.git_show_lines = function(ref)
+        assert.is_truthy(ref:find("abc12345full:src/a.lua"))
+        return { "commit line 1" }
+      end
+
+      init._open_file("src/a.lua", 1)
+
+      util.git_show_lines = orig_git_show
+
+      -- The scratch buffer should be current and named ghreview://commit/...
+      local cur_name = vim.api.nvim_buf_get_name(0)
+      assert.is_truthy(cur_name:find("^ghreview://commit/abc12345/src/a.lua$"))
+
+      local attached = false
+      for _, c in ipairs(minidiff_calls) do
+        if c.fn == "attach" and c.opts and c.opts.rel_path == "src/a.lua" then
+          attached = true
+        end
+      end
+      assert.is_true(attached)
+
+      -- Clean up the scratch buffer
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+          local name = vim.api.nvim_buf_get_name(buf)
+          if name:find("^ghreview://commit/") then
+            vim.api.nvim_buf_delete(buf, { force = true })
+          end
+        end
+      end
+    end)
+  end)
+
+  describe("toggle_view", function()
+    local function cleanup_test_buffers()
+      local cwd = vim.fn.getcwd()
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+          local name = vim.api.nvim_buf_get_name(buf)
+          if name == cwd .. "/src/a.lua" or name:find("^ghreview://") then
+            pcall(vim.api.nvim_buf_delete, buf, { force = true })
+          end
+        end
+      end
+    end
+
+    before_each(function()
+      cleanup_test_buffers()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "main", base_sha = "base123",
+        head_ref = "f", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+      state.set_files({ { path = "src/a.lua", status = "modified", additions = 1, deletions = 0 } })
+      state.set_view_mode("split")
+    end)
+
+    after_each(cleanup_test_buffers)
+
+    it("notifies when no active review", function()
+      state.clear()
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.toggle_view()
+
+      vim.notify = orig_notify
+      assert.is_truthy(notifications[1].msg:find("no active review"))
+    end)
+
+    it("flips split → inline and reopens the current file", function()
+      local opened
+      init._open_file = function(path, line) opened = { path = path, line = line } end
+
+      -- Set up a current buffer that looks like a PR file
+      local cwd = vim.fn.getcwd()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, cwd .. "/src/a.lua")
+      vim.api.nvim_set_current_buf(buf)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "l1", "l2", "l3" })
+      vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.toggle_view()
+
+      vim.notify = orig_notify
+
+      assert.are.equal("inline", state.get_view_mode())
+      assert.is_not_nil(opened)
+      assert.are.equal("src/a.lua", opened.path)
+      assert.are.equal(2, opened.line)
+
+      local notified = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("view mode → inline") then notified = true end
+      end
+      assert.is_true(notified)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("flips inline → split", function()
+      state.set_view_mode("inline")
+      local opened
+      init._open_file = function(path, line) opened = { path = path, line = line } end
+
+      local cwd = vim.fn.getcwd()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, cwd .. "/src/a.lua")
+      vim.api.nvim_set_current_buf(buf)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "x" })
+
+      init.toggle_view()
+
+      assert.are.equal("split", state.get_view_mode())
+      assert.are.equal("src/a.lua", opened.path)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("uses diff_review's current file and cursor when in split view", function()
+      local opened
+      init._open_file = function(path, line) opened = { path = path, line = line } end
+
+      -- Stub diff_review to look like an active split session
+      local dr = package.loaded["gh-review.ui.diff_review"]
+      dr.is_diff_active = function() return true end
+      dr.get_file_path = function() return "src/a.lua" end
+
+      -- Create a window whose cursor we'll be on
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "a", "b", "c", "d" })
+      vim.api.nvim_set_current_buf(buf)
+      vim.api.nvim_win_set_cursor(0, { 3, 0 })
+      local win = vim.api.nvim_get_current_win()
+      dr.get_work_win = function() return win end
+
+      init.toggle_view()
+
+      assert.are.equal("src/a.lua", opened.path)
+      assert.are.equal(3, opened.line)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+  end)
+
+  describe("next_file / prev_file", function()
+    local function cleanup_test_buffers()
+      local cwd = vim.fn.getcwd()
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf) then
+          local name = vim.api.nvim_buf_get_name(buf)
+          if name:find(cwd .. "/src/") or name:find("^ghreview://") then
+            pcall(vim.api.nvim_buf_delete, buf, { force = true })
+          end
+        end
+      end
+    end
+
+    before_each(function()
+      cleanup_test_buffers()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "main",
+        head_ref = "f", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+      state.set_files({
+        { path = "src/a.lua", status = "modified" },
+        { path = "src/b.lua", status = "modified" },
+        { path = "src/c.lua", status = "modified" },
+      })
+    end)
+
+    after_each(cleanup_test_buffers)
+
+    it("advances from current inline-view buffer to the next PR file", function()
+      local cwd = vim.fn.getcwd()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, cwd .. "/src/b.lua")
+      vim.api.nvim_set_current_buf(buf)
+
+      local opened
+      init._open_file = function(path) opened = path end
+
+      init.next_file()
+      assert.are.equal("src/c.lua", opened)
+
+      init.prev_file()
+      -- Current buf is still src/b.lua, so prev_file goes to src/a.lua
+      assert.are.equal("src/a.lua", opened)
+    end)
+
+    it("jumps to first file when not sitting on any PR file", function()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, "/tmp/unrelated.lua")
+      vim.api.nvim_set_current_buf(buf)
+
+      local opened
+      init._open_file = function(path) opened = path end
+
+      init.next_file()
+      assert.are.equal("src/a.lua", opened)
+
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("silent no-op when no PR is active", function()
+      state.clear()
+
+      local opened
+      init._open_file = function(path) opened = path end
+
+      init.next_file()
+      init.prev_file()
+      assert.is_nil(opened)
+    end)
+
+    it("notifies at the last file", function()
+      local cwd = vim.fn.getcwd()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, cwd .. "/src/c.lua")
+      vim.api.nvim_set_current_buf(buf)
+
+      local opened
+      init._open_file = function(path) opened = path end
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_file()
+      vim.notify = orig_notify
+
+      assert.is_nil(opened)
+      local warned = false
+      for _, m in ipairs(notifications) do
+        if m:find("last file") then warned = true end
+      end
+      assert.is_true(warned)
     end)
   end)
 end)

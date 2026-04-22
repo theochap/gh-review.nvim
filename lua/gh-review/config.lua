@@ -3,6 +3,8 @@ local M = {}
 
 ---@class GHReviewConfig
 ---@field gh_cmd string Path to gh CLI
+---@field default_view_mode "split"|"inline" Initial diff view mode per session
+---@field default_ignore_whitespace boolean Hide whitespace-only hunks by default
 ---@field keymaps GHReviewKeymaps
 ---@field icons GHReviewIcons
 ---@field float GHReviewFloat
@@ -12,6 +14,7 @@ local M = {}
 ---@field prefix string
 ---@field checkout string
 ---@field files string
+---@field files_focus string
 ---@field comments string
 ---@field reply string
 ---@field new_thread string
@@ -22,12 +25,19 @@ local M = {}
 ---@field description string
 ---@field toggle_overlay string
 ---@field open_minidiff string
+---@field toggle_view string
 ---@field review_current string
 ---@field next_comment string
 ---@field prev_comment string
 ---@field commits string
 ---@field next_diff string
 ---@field prev_diff string
+---@field next_file string
+---@field prev_file string
+---@field diffview string
+---@field unified string
+---@field ignore_whitespace string
+---@field toggle_linematch string
 
 ---@class GHReviewIcons
 ---@field added string
@@ -51,10 +61,13 @@ local M = {}
 ---@type GHReviewConfig
 M.defaults = {
   gh_cmd = "gh",
+  default_view_mode = "inline",
+  default_ignore_whitespace = true,
   keymaps = {
     prefix = "<leader>gp",
     checkout = "o",
     files = "f",
+    files_focus = "F",
     comments = "c",
     reply = "r",
     new_thread = "n",
@@ -65,12 +78,19 @@ M.defaults = {
     description = "d",
     toggle_overlay = "D",
     open_minidiff = "e",
+    toggle_view = "V",
     review_current = "O",
     commits = "C",
     next_comment = "]c",
     prev_comment = "[c",
     next_diff = "]d",
     prev_diff = "[d",
+    next_file = "<leader>gN",
+    prev_file = "<leader>gP",
+    diffview = "w",
+    unified = "u",
+    ignore_whitespace = "W",
+    toggle_linematch = "L",
   },
   icons = {
     added = "A",

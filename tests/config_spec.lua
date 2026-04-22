@@ -35,6 +35,14 @@ describe("config", function()
     it("includes open_minidiff keymap", function()
       assert.are.equal("e", config.get().keymaps.open_minidiff)
     end)
+
+    it("includes toggle_view keymap", function()
+      assert.are.equal("V", config.get().keymaps.toggle_view)
+    end)
+
+    it("defaults default_view_mode to inline", function()
+      assert.are.equal("inline", config.get().default_view_mode)
+    end)
   end)
 
   describe("setup", function()
@@ -96,6 +104,11 @@ describe("config", function()
       assert.are.equal("single", fl.border)
       assert.are.equal(100, fl.max_width)
       assert.are.equal(30, fl.max_height)
+    end)
+
+    it("default_view_mode override takes effect", function()
+      config.setup({ default_view_mode = "split" })
+      assert.are.equal("split", config.get().default_view_mode)
     end)
 
     it("unknown keys are preserved (forward-compat)", function()

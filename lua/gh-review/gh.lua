@@ -2,6 +2,7 @@
 local M = {}
 
 local config = require("gh-review.config")
+local util = require("gh-review.util")
 
 --- Run a gh command asynchronously
 ---@param args string[] Arguments to pass to gh
@@ -59,12 +60,34 @@ function M.run_sync(args, opts)
   return result.stdout, nil
 end
 
---- Checkout a PR branch
+--- Checkout a PR branch. In a colocated jj repository, follow up with
+--- `jj git import` so jj sees the new branch and HEAD movement — otherwise
+--- the user's jj state would silently diverge from git until they imported
+--- manually.
 ---@param pr_number number
 ---@param callback fun(err: string?)
 function M.checkout(pr_number, callback)
   M.run({ "pr", "checkout", tostring(pr_number) }, function(err, _)
-    callback(err)
+    if err then
+      callback(err)
+      return
+    end
+
+    local cwd = vim.fn.getcwd()
+    local jj_root = util.find_jj_root(cwd)
+    if not jj_root then
+      callback(nil)
+      return
+    end
+
+    util.jj_git_import_async(jj_root, function(import_err)
+      if import_err then
+        vim.notify("GHReview: jj git import failed: " .. import_err, vim.log.levels.WARN)
+      end
+      -- Checkout itself succeeded — surface the import failure as a warning
+      -- but don't fail the overall operation; review data can still load.
+      callback(nil)
+    end)
   end)
 end
 

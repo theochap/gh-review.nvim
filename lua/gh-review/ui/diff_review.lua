@@ -26,7 +26,7 @@ local function buf_valid(buf)
 	return buf ~= nil and vim.api.nvim_buf_is_valid(buf)
 end
 
---- Enable diff mode on both windows, disable folding, position cursor
+--- Enable diff mode on both windows, disable folding, position cursor.
 ---@param target_line? number
 local function setup_diff_windows(target_line)
 	vim.api.nvim_win_call(current.base_win, function()
@@ -93,7 +93,9 @@ function M.open(file_path, target_line)
 		current.base_buf = base_buf
 		current.base_win = vim.api.nvim_get_current_win()
 	else
-		local base_ref = pr.base_ref
+		-- Prefer the merge-base SHA so the diff matches GitHub's three-dot view;
+		-- fall back to the branch name if merge-base computation failed at load time.
+		local base_ref = pr.base_sha or pr.base_ref
 
 		-- Get base content from git
 		local base_lines = util.git_show_lines(base_ref .. ":" .. file_path, cwd)

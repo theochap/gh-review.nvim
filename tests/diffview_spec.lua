@@ -90,4 +90,5 @@ describe("diffview", function()
       diffview.close()
     end)
   end)
+
 end)

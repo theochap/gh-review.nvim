@@ -125,25 +125,35 @@ local function build_items(files, cwd)
   return items
 end
 
---- Toggle the file tree sidebar (open / focus / close cycle)
-function M.toggle()
+--- Look up the active files picker, if any.
+---@return table? picker
+local function get_picker()
   local ok, Snacks = pcall(require, "snacks")
   if not ok then
     vim.notify("GHReview: snacks.nvim required for file picker", vim.log.levels.ERROR)
+    return nil
+  end
+  local pickers = Snacks.picker.get({ source = "gh_review_files" })
+  return pickers[1]
+end
+
+--- Toggle the file tree sidebar strictly open/close — no intermediate focus step.
+--- Close always wins when the picker is open, regardless of which window is current.
+function M.open_or_close()
+  local picker = get_picker()
+  if picker then
+    picker:close()
     return
   end
+  M.show()
+end
 
-  local pickers = Snacks.picker.get({ source = "gh_review_files" })
-  if #pickers > 0 then
-    local picker = pickers[1]
-    local cur_win = vim.api.nvim_get_current_win()
-    local list_win = picker.list and picker.list.win
-    local win_id = type(list_win) == "table" and list_win.win or list_win
-    if win_id == cur_win then
-      picker:close()
-    else
-      picker:focus()
-    end
+--- Focus the file tree sidebar, opening it if it isn't already.
+--- Complement to `open_or_close` so focus and close are separate actions.
+function M.focus()
+  local picker = get_picker()
+  if picker then
+    picker:focus()
     return
   end
   M.show()
@@ -206,7 +216,7 @@ function M.show()
       local file = item._file_data
       if file then
         vim.cmd("wincmd l")
-        require("gh-review.ui.diff_review").open(file.path)
+        require("gh-review")._open_file(file.path)
       end
     end,
   })

@@ -251,12 +251,12 @@ describe("graphql", function()
       end
 
       local result_err
-      graphql.reply_to_thread("PR_ID", "THREAD_ID", "my reply", function(err)
+      graphql.reply_to_thread("THREAD_ID", "my reply", function(err)
         result_err = err
       end)
 
       assert.is_nil(result_err)
-      assert.are.equal("PR_ID", captured_vars.prId)
+      assert.is_nil(captured_vars.prId)
       assert.are.equal("THREAD_ID", captured_vars.threadId)
       assert.are.equal("my reply", captured_vars.body)
     end)
@@ -267,7 +267,7 @@ describe("graphql", function()
       end
 
       local result_err
-      graphql.reply_to_thread("PR_ID", "T_ID", "body", function(err)
+      graphql.reply_to_thread("T_ID", "body", function(err)
         result_err = err
       end)
 
