@@ -3,6 +3,7 @@ local M = {}
 
 local state = require("gh-review.state")
 local util = require("gh-review.util")
+local picker_util = require("gh-review.ui.picker_util")
 
 --- Toggle the commits picker (open / close)
 function M.toggle()
@@ -34,6 +35,8 @@ function M.show()
     return
   end
 
+  picker_util.ensure_highlights()
+
   local active_commit = state.get_active_commit()
   local items = {}
   for _, c in ipairs(commits) do
@@ -50,16 +53,21 @@ function M.show()
     title = "PR Commits",
     items = items,
     layout = { preset = "select", preview = false },
+    -- The commit the review is filtered to opens under the cursor, highlighted
+    -- across the whole entry so it is obvious a filter is in place.
+    on_show = function(picker)
+      picker_util.focus_current(picker, function(item) return item._is_active end)
+    end,
     format = function(item)
       local c = item._commit
-      local prefix = item._is_active and "> " or "  "
-      local prefix_hl = item._is_active and "CurSearch" or "SnacksPickerIdx"
+      local active = item._is_active
+      local entry_hl = active and picker_util.ACTIVE_ENTRY or nil
       local date = util.format_time(c.date or "")
       return {
-        { prefix, prefix_hl },
-        { c.sha, "Identifier" },
-        { " " .. c.message },
-        { "  @" .. c.author .. " " .. date, "Comment", virtual = true },
+        { active and "> " or "  ", active and picker_util.ACTIVE or "SnacksPickerIdx" },
+        { c.sha, entry_hl or "Identifier" },
+        { " " .. c.message, entry_hl },
+        { "  @" .. c.author .. " " .. date, entry_hl or "Comment", virtual = true },
       }
     end,
     confirm = function(picker, item)

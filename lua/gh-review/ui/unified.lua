@@ -91,12 +91,25 @@ local function row_for_new_line(row_map, target_line)
   return nil
 end
 
+--- The diff to render: the selected commit's own patch when the review is scoped
+--- to a commit, the PR-level diff otherwise. Without the first case this view
+--- would show every commit's changes to the file while the split and inline views
+--- show only the selected commit's.
+---@return string? diff_text
+local function diff_text_for_view()
+  local active_commit = state.get_active_commit()
+  if not active_commit then
+    return state.get_diff_text()
+  end
+  return util.git_commit_patch(active_commit.oid, vim.fn.getcwd())
+end
+
 --- Open the unified view for `file_path` (PR-relative), optionally positioning
 --- the cursor near the working-tree line `line`.
 ---@param file_path string
 ---@param line? number Working-tree line to jump to, if present in the diff.
 function M.open(file_path, line)
-  local diff_text = state.get_diff_text()
+  local diff_text = diff_text_for_view()
   if not diff_text or diff_text == "" then
     vim.notify("GHReview: no diff data loaded", vim.log.levels.WARN)
     return

@@ -171,5 +171,71 @@ describe("unified", function()
       unified.close()
       assert.is_false(unified.is_active())
     end)
+
+    it("renders the selected commit's own patch, not the whole PR diff", function()
+      state.set_pr({ number = 1, title = "t", base_ref = "main" })
+      -- The PR diff carries changes from every commit; the commit only touched one line
+      state.set_diff_text(table.concat({
+        "diff --git a/src/a.lua b/src/a.lua",
+        "--- a/src/a.lua",
+        "+++ b/src/a.lua",
+        "@@ -1,1 +1,3 @@",
+        " ctx",
+        "+from_this_commit",
+        "+from_a_later_commit",
+      }, "\n"))
+      state.set_active_commit({ sha = "abc1234", oid = "abc1234full", message = "m", author = "dev" })
+
+      local captured
+      local orig_system = vim.system
+      vim.system = function(cmd)
+        captured = cmd
+        return {
+          wait = function()
+            return {
+              code = 0,
+              stdout = table.concat({
+                "diff --git a/src/a.lua b/src/a.lua",
+                "--- a/src/a.lua",
+                "+++ b/src/a.lua",
+                "@@ -1,1 +1,2 @@",
+                " ctx",
+                "+from_this_commit",
+                "",
+              }, "\n"),
+              stderr = "",
+            }
+          end,
+        }
+      end
+
+      unified.open("src/a.lua")
+      vim.system = orig_system
+
+      assert.is_truthy(vim.tbl_contains(captured, "abc1234full"))
+      assert.is_truthy(vim.tbl_contains(captured, "-p"))
+      local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false)
+      assert.are.same({ "@@ -1,1 +1,2 @@", "ctx", "from_this_commit" }, lines)
+    end)
+
+    it("notifies instead of rendering when the commit's patch cannot be read", function()
+      state.set_pr({ number = 1, title = "t", base_ref = "main" })
+      state.set_diff_text("diff --git a/src/a.lua b/src/a.lua\n@@ -1,1 +1,1 @@\n+x")
+      state.set_active_commit({ sha = "abc1234", oid = "abc1234full", message = "m", author = "dev" })
+
+      local orig_system = vim.system
+      vim.system = function()
+        return { wait = function() return { code = 128, stdout = "", stderr = "bad object" } end }
+      end
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      unified.open("src/a.lua")
+
+      vim.system, vim.notify = orig_system, orig_notify
+      assert.is_false(unified.is_active())
+      assert.is_truthy(notifications[1]:find("no diff"))
+    end)
   end)
 end)

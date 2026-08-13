@@ -47,6 +47,7 @@ local M = {}
 ---@field base_ref string
 ---@field base_sha? string Merge-base SHA; use this (not base_ref) when diffing to match GitHub's three-dot semantics
 ---@field head_ref string
+---@field head_sha? string PR head commit OID; inline comments are anchored to it
 ---@field url string
 ---@field body string PR description markdown
 ---@field review_decision string "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | ""

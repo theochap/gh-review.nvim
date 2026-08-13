@@ -376,6 +376,72 @@ describe("gh", function()
       assert.is_truthy(result_err and result_err:find("pr not found"))
       assert.are.equal(1, #captured)
     end)
+
+    -- A secondary jj workspace has no git worktree, so `gh pr checkout` cannot
+    -- run there at all; the jj-native equivalent is used instead.
+    describe("in a jj workspace without a git worktree", function()
+      local vcs = require("gh-review.vcs")
+      local orig_context, orig_jj_checkout
+
+      before_each(function()
+        orig_context = vcs.context
+        orig_jj_checkout = vcs.jj_checkout
+        vcs.context = function() return { kind = "jj", root = "/ws", jj_root = "/ws" } end
+      end)
+
+      after_each(function()
+        vcs.context = orig_context
+        vcs.jj_checkout = orig_jj_checkout
+      end)
+
+      it("resolves the head branch and checks it out with jj", function()
+        orig_system = stub_vim_system({
+          { code = 0, stdout = vim.json.encode({ headRefName = "feat/x" }), stderr = "" },
+        }, captured)
+        gh = require("gh-review.gh")
+
+        local checked_out
+        vcs.jj_checkout = function(branch, cb)
+          checked_out = branch
+          cb(nil)
+        end
+
+        local result_err
+        local done = false
+        gh.checkout(42, function(err)
+          result_err = err
+          done = true
+        end)
+        vim.wait(100, function() return done end)
+
+        assert.is_nil(result_err)
+        assert.are.equal("feat/x", checked_out)
+        -- Only the metadata lookup goes through gh; no `gh pr checkout`
+        assert.are.equal(1, #captured)
+        assert.are.same({ "gh", "pr", "view", "42", "--json", "headRefName" }, captured[1].cmd)
+      end)
+
+      it("errors when the head branch cannot be resolved", function()
+        orig_system = stub_vim_system({
+          { code = 0, stdout = vim.json.encode({}), stderr = "" },
+        }, captured)
+        gh = require("gh-review.gh")
+
+        local called = false
+        vcs.jj_checkout = function() called = true end
+
+        local result_err
+        local done = false
+        gh.checkout(42, function(err)
+          result_err = err
+          done = true
+        end)
+        vim.wait(100, function() return done end)
+
+        assert.is_false(called)
+        assert.is_truthy(result_err and result_err:find("head branch"))
+      end)
+    end)
   end)
 
   describe("pr_view", function()
@@ -401,6 +467,8 @@ describe("gh", function()
       assert.are.equal("--json", cmd[5])
       assert.is_truthy(cmd[6]:find("number"))
       assert.is_truthy(cmd[6]:find("title"))
+      -- Needed as the commit_id for immediately-posted inline comments
+      assert.is_truthy(cmd[6]:find("headRefOid"))
       assert.are.equal(42, result_data.number)
     end)
   end)
@@ -510,6 +578,130 @@ describe("gh", function()
       assert.are.equal("--json", cmd[4])
       -- No number argument before --json
     end)
+
+    -- Under jj, git HEAD is detached and `gh pr view` with no argument fails,
+    -- so the PR is looked up by each jj bookmark instead.
+    describe("with jj bookmark candidates", function()
+      local vcs = require("gh-review.vcs")
+      local orig_candidates
+
+      before_each(function()
+        orig_candidates = vcs.pr_branch_candidates_async
+      end)
+
+      after_each(function()
+        vcs.pr_branch_candidates_async = orig_candidates
+      end)
+
+      it("looks the PR up by bookmark name", function()
+        vcs.pr_branch_candidates_async = function(cb) cb({ "feat/x" }) end
+        orig_system = stub_vim_system({
+          { code = 0, stdout = vim.json.encode({ number = 7, title = "t" }), stderr = "" },
+        }, captured)
+        gh = require("gh-review.gh")
+
+        local result, done = nil, false
+        gh.pr_view_current(function(_, data)
+          result = data
+          done = true
+        end)
+        vim.wait(100, function() return done end)
+
+        assert.are.equal(7, result.number)
+        assert.are.equal("feat/x", captured[1].cmd[4])
+        assert.are.equal("--json", captured[1].cmd[5])
+      end)
+
+      it("tries the next bookmark when the first has no PR", function()
+        vcs.pr_branch_candidates_async = function(cb) cb({ "push-abc", "feat/x" }) end
+        orig_system = stub_vim_system({
+          { code = 1, stdout = "", stderr = "no pull requests found" },
+          { code = 0, stdout = vim.json.encode({ number = 9 }), stderr = "" },
+        }, captured)
+        gh = require("gh-review.gh")
+
+        local result, done = nil, false
+        gh.pr_view_current(function(_, data)
+          result = data
+          done = true
+        end)
+        vim.wait(100, function() return done end)
+
+        assert.are.equal(9, result.number)
+        assert.are.equal(2, #captured)
+        assert.are.equal("push-abc", captured[1].cmd[4])
+        assert.are.equal("feat/x", captured[2].cmd[4])
+      end)
+
+      it("reports the bookmarks it tried when none has a PR", function()
+        vcs.pr_branch_candidates_async = function(cb) cb({ "a", "b" }) end
+        orig_system = stub_vim_system({
+          { code = 1, stdout = "", stderr = "no pull requests found" },
+        }, captured)
+        gh = require("gh-review.gh")
+
+        local err, done = nil, false
+        gh.pr_view_current(function(e)
+          err = e
+          done = true
+        end)
+        vim.wait(100, function() return done end)
+
+        assert.are.equal(2, #captured)
+        assert.is_truthy(err and err:find("a, b", 1, true))
+      end)
+    end)
+  end)
+
+  describe("pr_view_branch", function()
+    it("returns the first branch that resolves to a PR", function()
+      orig_system = stub_vim_system({
+        { code = 1, stdout = "", stderr = "no pull requests found" },
+        { code = 0, stdout = vim.json.encode({ number = 12, title = "stacked" }), stderr = "" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local result, err, done = nil, nil, false
+      gh.pr_view_branch({ "main", "feat/two" }, function(e, data)
+        err, result, done = e, data, true
+      end)
+      vim.wait(100, function() return done end)
+
+      assert.is_nil(err)
+      assert.are.equal(12, result.number)
+      assert.are.equal(2, #captured)
+      assert.are.equal("main", captured[1].cmd[4])
+      assert.are.equal("feat/two", captured[2].cmd[4])
+      -- The head SHA is needed to post immediate comments on the loaded PR
+      assert.is_truthy(captured[2].cmd[6]:find("headRefOid", 1, true))
+    end)
+
+    it("reports the branches it tried when none has a PR", function()
+      orig_system = stub_vim_system({
+        { code = 1, stdout = "", stderr = "no pull requests found" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local err, done = nil, false
+      gh.pr_view_branch({ "a", "b" }, function(e)
+        err, done = e, true
+      end)
+      vim.wait(100, function() return done end)
+
+      assert.are.equal(2, #captured)
+      assert.is_truthy(err and err:find("a, b", 1, true))
+    end)
+
+    it("errors without calling gh when there is no branch to try", function()
+      orig_system = stub_vim_system({ { code = 0, stdout = "", stderr = "" } }, captured)
+      gh = require("gh-review.gh")
+
+      local err
+      gh.pr_view_branch({}, function(e) err = e end)
+
+      assert.is_truthy(err)
+      assert.are.equal(0, #captured)
+    end)
   end)
 
   describe("pr_add_comment", function()
@@ -529,6 +721,118 @@ describe("gh", function()
       assert.are.equal("99", cmd[4])
       assert.are.equal("--body", cmd[5])
       assert.are.equal("Great work!", cmd[6])
+    end)
+  end)
+
+  describe("pr_add_review_comment", function()
+    --- Map of the -f/-F key=value pairs in a gh api call.
+    ---@param cmd string[]
+    ---@return table<string, string>
+    local function fields(cmd)
+      local out = {}
+      for i, v in ipairs(cmd) do
+        if v == "-f" or v == "-F" then
+          local key, val = (cmd[i + 1] or ""):match("^([^=]+)=(.*)$")
+          if key then out[key] = val end
+        end
+      end
+      return out
+    end
+
+    it("posts to the REST comments endpoint with a single line", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = "{}", stderr = "" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local err, done = "unset", false
+      gh.pr_add_review_comment(42, {
+        repo = "owner/repo",
+        body = "nit: typo",
+        commit_id = "deadbeef",
+        path = "src/a.lua",
+        line = 12,
+        start_line = 12,
+      }, function(e)
+        err = e
+        done = true
+      end)
+      vim.wait(100, function() return done end)
+
+      assert.is_nil(err)
+      -- No repo lookup needed when the caller already knows it.
+      assert.are.equal(1, #captured)
+      local cmd = captured[1].cmd
+      assert.are.same({ "gh", "api", "--method", "POST", "repos/owner/repo/pulls/42/comments" },
+        { cmd[1], cmd[2], cmd[3], cmd[4], cmd[5] })
+
+      local f = fields(cmd)
+      assert.are.equal("nit: typo", f.body)
+      assert.are.equal("deadbeef", f.commit_id)
+      assert.are.equal("src/a.lua", f.path)
+      assert.are.equal("RIGHT", f.side)
+      assert.are.equal("12", f.line)
+      -- start_line == line is not a range, so GitHub must not be sent one
+      assert.is_nil(f.start_line)
+      assert.is_nil(f.start_side)
+    end)
+
+    it("sends a range for multi-line comments", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = "{}", stderr = "" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local done = false
+      gh.pr_add_review_comment(7, {
+        repo = "o/r",
+        body = "b",
+        commit_id = "sha",
+        path = "p",
+        line = 20,
+        start_line = 18,
+      }, function() done = true end)
+      vim.wait(100, function() return done end)
+
+      local f = fields(captured[1].cmd)
+      assert.are.equal("18", f.start_line)
+      assert.are.equal("RIGHT", f.start_side)
+      assert.are.equal("20", f.line)
+    end)
+
+    it("looks up the repo when it was not provided", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = "owner/repo\n", stderr = "" }, -- repo_name
+        { code = 0, stdout = "{}", stderr = "" },           -- POST
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local done = false
+      gh.pr_add_review_comment(1, {
+        body = "b", commit_id = "sha", path = "p", line = 1,
+      }, function() done = true end)
+      vim.wait(100, function() return done end)
+
+      assert.are.equal(2, #captured)
+      assert.are.equal("repos/owner/repo/pulls/1/comments", captured[2].cmd[5])
+    end)
+
+    it("propagates a failed post", function()
+      orig_system = stub_vim_system({
+        { code = 1, stdout = "", stderr = "line must be part of the diff" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local err, done = nil, false
+      gh.pr_add_review_comment(1, {
+        repo = "o/r", body = "b", commit_id = "sha", path = "p", line = 1,
+      }, function(e)
+        err = e
+        done = true
+      end)
+      vim.wait(100, function() return done end)
+
+      assert.is_truthy(err and err:find("part of the diff", 1, true))
     end)
   end)
 
@@ -684,7 +988,19 @@ describe("gh", function()
   end)
 
   describe("graphql", function()
-    it("constructs -F args from variables", function()
+    --- Collect the values passed with a given flag, e.g. flag_values(cmd, "-f").
+    ---@param cmd string[]
+    ---@param flag string
+    ---@return table<string, true>
+    local function flag_values(cmd, flag)
+      local found = {}
+      for i, v in ipairs(cmd) do
+        if v == flag then found[cmd[i + 1]] = true end
+      end
+      return found
+    end
+
+    it("sends strings as raw fields and numbers as typed fields", function()
       local json_str = vim.json.encode({ data = { result = true } })
       orig_system = stub_vim_system({
         { code = 0, stdout = json_str, stderr = "" },
@@ -700,21 +1016,11 @@ describe("gh", function()
       local cmd = captured[1].cmd
       assert.are.equal("api", cmd[2])
       assert.are.equal("graphql", cmd[3])
-      -- Find -F arguments
-      local f_args = {}
-      for i, v in ipairs(cmd) do
-        if v == "-F" then
-          table.insert(f_args, cmd[i + 1])
-        end
-      end
-      -- Should have owner=me and number=5
-      local found_owner, found_number = false, false
-      for _, arg in ipairs(f_args) do
-        if arg == "owner=me" then found_owner = true end
-        if arg == "number=5" then found_number = true end
-      end
-      assert.is_true(found_owner)
-      assert.is_true(found_number)
+      -- Numbers are typed (-F); strings must stay raw (-f) so a numeric-looking
+      -- body like "42" isn't coerced into an Int.
+      assert.is_true(flag_values(cmd, "-F")["number=5"])
+      assert.is_true(flag_values(cmd, "-f")["owner=me"])
+      assert.is_nil(flag_values(cmd, "-F")["owner=me"])
 
       -- Should have -f query=...
       local has_query = false
@@ -724,6 +1030,19 @@ describe("gh", function()
         end
       end
       assert.is_true(has_query)
+    end)
+
+    it("keeps a numeric-looking string body a string", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = vim.json.encode({ data = {} }), stderr = "" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local done = false
+      gh.graphql("mutation { x }", { body = "42" }, function() done = true end)
+      vim.wait(100, function() return done end)
+
+      assert.is_true(flag_values(captured[1].cmd, "-f")["body=42"])
     end)
 
     it("returns data.data on success", function()

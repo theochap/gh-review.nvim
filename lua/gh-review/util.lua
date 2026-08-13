@@ -43,12 +43,43 @@ function M.build_thread_context(comments)
   return context_lines
 end
 
+--- `git diff-tree` arguments describing what a single commit changed, in the same
+--- first-parent terms the split and inline views diff against (`<oid>~1`).
+---
+--- `--root` and `--diff-merges=first-parent` are what keep the answer complete:
+--- plain `git diff-tree` prints *nothing at all* for a merge commit or for a root
+--- commit, so without them selecting either kind of commit shows an empty diff.
+---@param format string[] Output flags, e.g. { "--name-status" } or { "-p" }
+---@param oid string Commit to describe
+---@return string[] args
+function M.commit_diff_args(format, oid)
+  local args = { "diff-tree", "--no-commit-id", "-r", "-M", "--root", "--diff-merges=first-parent" }
+  vim.list_extend(args, format)
+  table.insert(args, oid)
+  return args
+end
+
+--- The commit's changes as a unified diff, for views that render diff text rather
+--- than two file versions.
+---@param oid string
+---@param cwd string
+---@return string? diff_text nil when git fails or the commit changed nothing
+function M.git_commit_patch(oid, cwd)
+  local cmd = require("gh-review.vcs").git_cmd(M.commit_diff_args({ "-p" }, oid), cwd)
+  local result = vim.system(cmd, { text = true, cwd = cwd }):wait()
+  if result.code ~= 0 or not result.stdout or result.stdout == "" then
+    return nil
+  end
+  return result.stdout
+end
+
 --- Run `git show <ref>` synchronously, return lines with trailing blank removed
 ---@param ref string e.g. "origin/main:path/to/file"
 ---@param cwd string working directory
 ---@return string[] lines (empty table on failure)
 function M.git_show_lines(ref, cwd)
-  local result = vim.system({ "git", "show", ref }, { text = true, cwd = cwd }):wait()
+  local cmd = require("gh-review.vcs").git_cmd({ "show", ref }, cwd)
+  local result = vim.system(cmd, { text = true, cwd = cwd }):wait()
   if result.code ~= 0 or not result.stdout then
     return {}
   end
@@ -59,15 +90,21 @@ function M.git_show_lines(ref, cwd)
   return lines
 end
 
---- Compute merge-base between a base ref and HEAD.
+--- Compute merge-base between a base ref and the current work.
 --- Tries `origin/<base_ref>` first (matches state after `gh pr checkout`), then falls back to `<base_ref>`.
 --- Returns nil if neither resolves — callers should fall back to the branch name.
+--- The current side is `HEAD`, except in a jj workspace where HEAD belongs to
+--- another checkout and the working-copy commit is used instead (see vcs.lua).
 ---@param base_ref string Base branch name, e.g. "main"
 ---@param cwd string working directory
 ---@return string? sha Full commit SHA of the merge base, or nil on failure
 function M.git_merge_base(base_ref, cwd)
+  local vcs = require("gh-review.vcs")
+  local head = vcs.head_rev(cwd)
+  if not head then return nil end
   for _, ref in ipairs({ "origin/" .. base_ref, base_ref }) do
-    local result = vim.system({ "git", "merge-base", ref, "HEAD" }, { text = true, cwd = cwd }):wait()
+    local cmd = vcs.git_cmd({ "merge-base", ref, head }, cwd)
+    local result = vim.system(cmd, { text = true, cwd = cwd }):wait()
     if result.code == 0 and result.stdout then
       local sha = vim.trim(result.stdout)
       if sha ~= "" then
@@ -85,9 +122,7 @@ end
 ---@param cwd string
 ---@return string?
 function M.find_jj_root(cwd)
-  local matches = vim.fs.find(".jj", { path = cwd, upward = true, type = "directory", limit = 1 })
-  if #matches == 0 then return nil end
-  return vim.fs.dirname(matches[1])
+  return require("gh-review.vcs").jj_root(cwd)
 end
 
 --- Run `jj git import` asynchronously to sync jj's view of the git refs after

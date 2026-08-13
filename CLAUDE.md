@@ -12,16 +12,24 @@ lua/gh-review/
   gh.lua            -- Async gh CLI wrapper (vim.system)
   graphql.lua       -- GraphQL queries (threads, replies, resolve)
   diff.lua          -- Unified diff parser and thread line mapping
+  vcs.lua           -- git/jj layout detection (git-dir, gh repo id, bookmarks, stack)
+  util.lua          -- git plumbing helpers (merge base, per-commit diff args)
+  reviewed_store.lua -- Persisted per-PR "reviewed" file marks
   health.lua        -- :checkhealth gh-review
   ui/
     comments.lua    -- Floating comment thread popup
     comment_input.lua -- Floating input window for replies/new threads
+    commits.lua     -- Commits sidebar (commit filter, snacks.nvim picker)
     description.lua -- PR description page
     diagnostics.lua -- vim.diagnostic integration for comment threads
     diff_review.lua -- Native Neovim diff split (base vs working)
     files.lua       -- File tree sidebar (snacks.nvim picker)
     minidiff.lua    -- mini.diff integration (gutter signs + overlay)
+    picker_util.lua -- Shared picker highlight groups + focus-current-entry
     pr_picker.lua   -- PR selection picker (snacks.nvim)
+    review_submit.lua -- Pending-review panel (list + submit as comment/approve/reject)
+    stack.lua       -- jj stack picker (trunk..tip)
+    unified.lua     -- Unified single-buffer diff view
   integrations/
     diffview.lua    -- diffview.nvim integration
     lualine.lua     -- Statusline component

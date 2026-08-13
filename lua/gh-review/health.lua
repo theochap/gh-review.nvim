@@ -22,6 +22,36 @@ function M.check()
     vim.health.error("gh not authenticated", { "Run: gh auth login" })
   end
 
+  -- Report the detected VCS layout. jj repositories need extra handling (see
+  -- vcs.lua), so surfacing what was detected is the fastest way to diagnose
+  -- "no PR found for current branch" or empty base-side diffs.
+  local vcs = require("gh-review.vcs")
+  local ctx = vcs.context()
+  local info = vcs.describe()
+  if ctx.kind == "none" then
+    vim.health.warn("no git or jj repository found in the current directory")
+  elseif ctx.kind == "jj" and not ctx.git_dir then
+    vim.health.error("jj workspace found but its backing git repository could not be resolved", {
+      "gh-review needs a git-backed jj repo (jj git init / jj git clone)",
+    })
+  else
+    vim.health.ok(table.concat(info, ", "))
+  end
+  if ctx.jj_root then
+    if vim.fn.executable("jj") == 1 then
+      local jj_version = vim.fn.system({ "jj", "--version" })
+      vim.health.ok("jj found: " .. vim.trim(jj_version:match("[^\n]+") or jj_version))
+    else
+      vim.health.error("jj repository detected but jj executable not found", {
+        "Install jj: https://github.com/jj-vcs/jj",
+      })
+    end
+    local candidates = vcs.pr_branch_candidates()
+    if #candidates > 0 then
+      vim.health.info("PR lookup bookmarks: " .. table.concat(candidates, ", "))
+    end
+  end
+
   -- Check neovim version
   if vim.fn.has("nvim-0.10") == 1 then
     vim.health.ok("Neovim >= 0.10")

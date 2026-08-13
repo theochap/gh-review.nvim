@@ -28,6 +28,11 @@ A few notes:
 - [`gh` CLI](https://cli.github.com/) authenticated (`gh auth login`)
 - [snacks.nvim](https://github.com/folke/snacks.nvim) — file/PR pickers
 
+Works in plain git repos and in [jj](https://github.com/jj-vcs/jj) repos of any
+layout — colocated, non-colocated, or a secondary `jj workspace add` workspace
+(where there is no `.git` at all). PRs are found via jj bookmarks since jj keeps
+git HEAD detached; see `:help gh-review-jj`.
+
 **Optional integrations:**
 [diffview.nvim](https://github.com/sindrets/diffview.nvim) |
 [mini.diff](https://github.com/echasnovski/mini.diff) |
@@ -69,7 +74,14 @@ notifies you with a hint to press `<leader>gpO`.
 | `<leader>gpC` | | Toggle commits sidebar (filter by commit) |
 | `<leader>gpc` | `:GHReview comments` | Toggle comments panel (trouble.nvim) |
 | `<leader>gpr` | | Reply to thread at cursor |
-| `<leader>gpn` | | New inline comment thread |
+| `<leader>gpn` | | New inline comment thread (queued in your pending review) |
+| `<leader>gpN` | | New inline comment, posted immediately |
+| `<leader>gpp` | `:GHReview pending` | Review unsubmitted comments and submit them all |
+| | `:GHReview submit [event]` | Submit pending review (`comment`/`approve`/`request-changes`) |
+| `<leader>gpa` | `:GHReview review [event]` | Approve / comment / request changes on the whole PR |
+| `<leader>gps` | `:GHReview stack-next` | Next commit in the jj stack (loads the next PR if needed) |
+| `<leader>gpS` | `:GHReview stack-prev` | Previous commit in the jj stack |
+| `<leader>gpk` | `:GHReview stack` | Toggle the jj stack picker (trunk..tip) |
 | `<leader>gpt` | | Toggle resolve/unresolve |
 | `<leader>gpv` | `:GHReview hover` | View comment at cursor |
 | `<leader>gpd` | `:GHReview description` | PR description page |
@@ -78,13 +90,16 @@ notifies you with a hint to press `<leader>gpO`.
 | `<leader>gpR` | `:GHReview refresh` | Refresh PR data |
 | `<leader>gpq` | `:GHReview close` | Close review session |
 | `]c` / `[c` | | Next/previous comment (cross-file) |
-| `]d` / `[d` | | Next/previous diff hunk (cross-file) |
+| `]d` / `[d` | | Next/previous diff hunk (cross-file, in sidebar order) |
 
 **Buffer-local keymaps:**
 
 - Comment thread: `r` reply, `t` resolve, `o` browser, `q` close
+- Pending review panel: `<cr>` jump to comment, `s` submit as comment, `a` approve,
+  `x` request changes, `q` close
 - Trouble panel: `r` reply, `t` resolve, `v` view thread, `<cr>` jump to diff
 - Commits panel: `<cr>` select/deselect commit, `x` clear filter
+- Stack picker: `<cr>` move the review to the commit, `x` clear filter
 - Description: `q` close, `o` open in browser, `n` new comment, `r` reply,
   `<cr>` select commit (on commit line), `x` clear filter
 - Comment input: `<C-s>` submit, `<Esc><Esc>` cancel
@@ -104,6 +119,9 @@ require("gh-review").setup({
     comments = "c",
     reply = "r",
     new_thread = "n",
+    new_thread_direct = "N",
+    pending_review = "p",
+    review_pr = "a",
     toggle_resolve = "t",
     hover = "v",
     description = "d",
@@ -116,6 +134,9 @@ require("gh-review").setup({
     commits = "C",
     next_diff = "]d",
     prev_diff = "[d",
+    next_stack = "s",
+    prev_stack = "S",
+    stack = "k",
   },
   icons = {
     added = "A",
@@ -148,6 +169,37 @@ Comment navigation and the files picker open a native Neovim diff split: working
 ### Commit filtering
 
 `<leader>gpC` opens the commits sidebar. Select a commit to filter the entire session — files, comments, diagnostics, and diffs all narrow to that commit's changes. Select again or press `x` to return to the full PR view. Commits are also selectable from the description page.
+
+Everything is scoped against the commit's first parent (`<oid>~1`): the file tree, the split, the inline overlay and the unified buffer (`<leader>gpu`). Merge commits are shown against their first parent and root commits against the empty tree, so selecting either lists its files like any other commit.
+
+While a filter is in place, both this picker and the stack picker open with the cursor on the selected commit and highlight the whole entry, so it is obvious which commit the session is scoped to. The highlights come from two `default`-linked groups you can override:
+
+```lua
+vim.api.nvim_set_hl(0, "GHReviewPickerActive", { link = "IncSearch" })      -- the `>` marker (default: CurSearch)
+vim.api.nvim_set_hl(0, "GHReviewPickerActiveEntry", { link = "PmenuSel" }) -- the rest of the entry (default: Visual)
+```
+
+### Stacked PRs (jj)
+
+`<leader>gps` moves the review to the direct descendant of the commit you are on, `<leader>gpS` to its ancestor. The starting point is the commit the review is filtered to, or the PR head when it isn't — so from an unfiltered review, `<leader>gps` walks into the next PR of the stack.
+
+If the neighbour belongs to the PR already loaded, the session just re-filters to it. If it belongs to another PR, that PR is identified by the nearest jj bookmark at or below the commit, loaded, and then filtered to the commit. The working copy never moves, so nothing is checked out. Forked stacks prompt with `vim.ui.select`.
+
+`<leader>gpk` previews the whole stack — every commit from `trunk()` to the tip of the branch you are on, so the PRs below the one under review *and* the ones stacked above it, tip first — in a floating picker (capped at 100 commits from the tip). Entries show the commit id, description, bookmarks, `#<pr>` when the commit is part of the PR under review, and the author; the commit you are on is marked `>`, highlighted across the entry, and is where the picker opens. Press `<cr>` to jump the review to a commit, following the same cross-PR rules. It works before any review is loaded, so you can use it to choose which PR of the stack to open.
+
+Both the picker and the step keymaps anchor on the PR head **branch** as well as the head commit, and steps walk the change (`change_id`) rather than the commit id. The oid GitHub reports is the commit as pushed, so after a local rebase or amend nothing descends from it any more — anchoring on it alone would list the PRs below the review and none above it. For the same reason the `>` marker and the `#<pr>` badges match on change ids too, so they keep pointing at the right commit after a rewrite.
+
+### Pending vs. immediate comments
+
+`<leader>gpn` creates an inline thread the way GitHub's review flow does: it lands in your *pending* review and stays invisible to everyone until the review is submitted. `<leader>gpp` lists everything still pending (file, line range, body), lets you jump to each with `<cr>`, and publishes the whole batch with `s` (comment), `a` (approve) or `x` (request changes), after prompting for an optional summary.
+
+`<leader>gpN` skips all that and posts the comment immediately as a standalone thread, leaving any pending review untouched.
+
+### Approving the whole PR
+
+`<leader>gpa` gives the PR a verdict, whether or not you wrote any inline comments: it asks approve / comment / request changes, then opens an input for the review body (optional for an approval — GitHub rejects a bodyless comment or request for changes). `:GHReview review approve` skips the prompt.
+
+Pending comments, if you have any, are published together with the verdict and the input title says how many. GitHub only lets you have one review open at a time, so leaving them queued isn't possible.
 
 ### mini.diff
 

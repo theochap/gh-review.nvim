@@ -116,6 +116,55 @@ describe("util", function()
     end)
   end)
 
+  describe("commit_diff_args", function()
+    it("describes a commit against its first parent, merges and roots included", function()
+      local args = util.commit_diff_args({ "--name-status" }, "abc123")
+
+      assert.are.same({
+        "diff-tree", "--no-commit-id", "-r", "-M", "--root",
+        "--diff-merges=first-parent", "--name-status", "abc123",
+      }, args)
+    end)
+
+    it("takes any output format", function()
+      local args = util.commit_diff_args({ "-p" }, "abc123")
+      assert.are.equal("-p", args[#args - 1])
+      assert.are.equal("abc123", args[#args])
+    end)
+  end)
+
+  describe("git_commit_patch", function()
+    it("returns the patch text of the commit", function()
+      local orig_system = vim.system
+      local captured
+      vim.system = function(cmd)
+        captured = cmd
+        return { wait = function() return { code = 0, stdout = "diff --git a/f b/f\n" } end }
+      end
+
+      local patch = util.git_commit_patch("abc123", "/tmp/repo")
+      vim.system = orig_system
+
+      assert.are.equal("diff --git a/f b/f\n", patch)
+      assert.are.equal("git", captured[1])
+      assert.is_truthy(vim.tbl_contains(captured, "--diff-merges=first-parent"))
+    end)
+
+    it("returns nothing when git fails or the commit changed nothing", function()
+      local orig_system = vim.system
+      vim.system = function()
+        return { wait = function() return { code = 128, stdout = "", stderr = "fatal" } end }
+      end
+      assert.is_nil(util.git_commit_patch("abc123", "/tmp"))
+
+      vim.system = function()
+        return { wait = function() return { code = 0, stdout = "" } end }
+      end
+      assert.is_nil(util.git_commit_patch("abc123", "/tmp"))
+      vim.system = orig_system
+    end)
+  end)
+
   describe("git_show_lines", function()
     it("returns lines from successful git show", function()
       local orig_system = vim.system

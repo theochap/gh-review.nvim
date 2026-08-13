@@ -110,11 +110,15 @@ describe("init", function()
       get_work_win = function() return nil end,
     }
 
-    -- Stub files UI
+    -- Stub files UI. display_order is pure ordering logic that cross-file
+    -- navigation depends on, so keep the real implementation.
+    local real_files = require("gh-review.ui.files")
     package.loaded["gh-review.ui.files"] = {
       open_or_close = function() end,
       focus = function() end,
       show = function() end,
+      sync_selection = function() end,
+      display_order = real_files.display_order,
     }
 
     -- Stub snacks (for close_snacks_picker)
@@ -762,6 +766,25 @@ describe("init", function()
       assert.are.equal("abc1234", active.sha)
     end)
 
+    it("asks git for the changes of merge and root commits too", function()
+      orig_system = vim.system
+      vim.system = function(cmd)
+        table.insert(captured_cmds, cmd)
+        return { wait = function() return { code = 0, stdout = "", stderr = "" } end }
+      end
+      init._refresh_views = function() end
+
+      init.select_commit({ sha = "abc1234", oid = "abc1234full", message = "merge", author = "dev" })
+
+      -- Plain `git diff-tree` prints nothing for a merge or a root commit, so
+      -- without these the file list of such a commit would come back empty
+      for _, cmd in ipairs(captured_cmds) do
+        assert.is_truthy(vim.tbl_contains(cmd, "--root"))
+        assert.is_truthy(vim.tbl_contains(cmd, "--diff-merges=first-parent"))
+      end
+      assert.are.equal(2, #captured_cmds)
+    end)
+
     it("parses renamed files with old_path", function()
       orig_system = vim.system
       local call_count = 0
@@ -1033,6 +1056,522 @@ describe("init", function()
       init.clear_commit()
 
       assert.is_false(refreshed)
+    end)
+  end)
+
+  describe("next_stack_commit / prev_stack_commit", function()
+    local vcs = require("gh-review.vcs")
+    local orig_vcs = {}
+
+    local function set_pr(head_sha)
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m",
+        head_ref = "f", head_sha = head_sha, url = "", body = "",
+        review_decision = "", repository = "o/r",
+      })
+      state.set_commits({
+        { sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" },
+        { sha = "bbb2222", oid = "bbb2222full", message = "second", author = "dev" },
+      })
+    end
+
+    --- Stub the jj graph: `commits` is what jj_adjacent reports back. Change ids
+    --- resolve to the revision itself so assertions can stay on the anchor.
+    ---@return table captured { rev, direction, resolved }
+    local function stub_jj(commits)
+      local captured = {}
+      vcs.jj_root = function() return "/tmp/ws" end
+      vcs.jj_change_id = function(rev, cb)
+        captured.resolved = rev
+        cb(nil, rev)
+      end
+      vcs.jj_adjacent = function(rev, direction, cb)
+        captured.rev, captured.direction = rev, direction
+        cb(nil, commits)
+      end
+      return captured
+    end
+
+    before_each(function()
+      orig_vcs.jj_root = vcs.jj_root
+      orig_vcs.jj_adjacent = vcs.jj_adjacent
+      orig_vcs.jj_change_id = vcs.jj_change_id
+      orig_vcs.jj_downstream_bookmarks = vcs.jj_downstream_bookmarks
+      orig_vcs.head_rev = vcs.head_rev
+    end)
+
+    after_each(function()
+      for name, fn in pairs(orig_vcs) do
+        vcs[name] = fn
+      end
+      orig_vcs = {}
+    end)
+
+    it("notifies when no active review", function()
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.is_truthy(notifications[1]:find("no active review"))
+    end)
+
+    it("warns when the repo is not a jj workspace", function()
+      set_pr("bbb2222full")
+      vcs.jj_root = function() return nil end
+      local spawned = false
+      vcs.jj_adjacent = function() spawned = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.is_false(spawned)
+      assert.is_truthy(notifications[1]:find("jj workspace"))
+    end)
+
+    it("filters to the child commit when it belongs to the loaded PR", function()
+      set_pr("aaa1111full")
+      state.set_active_commit({ sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" })
+      local captured = stub_jj({ { commit_id = "bbb2222full", bookmarks = {}, description = "second" } })
+
+      local selected
+      init.select_commit = function(commit) selected = commit end
+      local loaded = false
+      init._load_pr_data = function() loaded = true end
+
+      init.next_stack_commit()
+
+      -- Anchored on the commit under review, walking upwards
+      assert.are.equal("aaa1111full", captured.rev)
+      assert.are.equal("children", captured.direction)
+      assert.are.equal("bbb2222full", selected.oid)
+      assert.is_false(loaded)
+    end)
+
+    it("walks from the change of a commit that was rewritten locally", function()
+      set_pr("bbb2222full")
+      state.set_active_commit({ sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" })
+      -- The pushed oid is stale; its change id points at the commit that replaced it
+      local asked, walked = nil, nil
+      vcs.jj_root = function() return "/tmp/ws" end
+      vcs.jj_change_id = function(rev, cb)
+        asked = rev
+        cb(nil, "vtwxtppqqmtknklz")
+      end
+      vcs.jj_adjacent = function(rev, _, cb)
+        walked = rev
+        cb(nil, { { commit_id = "bbb2222full", bookmarks = {}, description = "second" } })
+      end
+      local selected
+      init.select_commit = function(commit) selected = commit end
+
+      init.next_stack_commit()
+
+      assert.are.equal("aaa1111full", asked)
+      assert.are.equal("vtwxtppqqmtknklz", walked)
+      assert.are.equal("bbb2222full", selected.oid)
+    end)
+
+    it("warns when the commit is not in the jj workspace at all", function()
+      set_pr("bbb2222full")
+      vcs.jj_root = function() return "/tmp/ws" end
+      vcs.jj_change_id = function(_, cb) cb(nil, nil) end
+      local walked = false
+      vcs.jj_adjacent = function() walked = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.is_false(walked)
+      assert.is_truthy(table.concat(notifications, "\n"):find("not in this jj workspace"))
+    end)
+
+    it("anchors on the PR head when the review is not commit-scoped", function()
+      set_pr("bbb2222full")
+      local captured = stub_jj({})
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.are.equal("bbb2222full", captured.rev)
+    end)
+
+    it("walks to the parent commit in the other direction", function()
+      set_pr("bbb2222full")
+      state.set_active_commit({ sha = "bbb2222", oid = "bbb2222full", message = "second", author = "dev" })
+      local captured = stub_jj({ { commit_id = "aaa1111full", bookmarks = {}, description = "first" } })
+      local selected
+      init.select_commit = function(commit) selected = commit end
+
+      init.prev_stack_commit()
+
+      assert.are.equal("parents", captured.direction)
+      assert.are.equal("aaa1111full", selected.oid)
+    end)
+
+    it("reports when the stack has no neighbour in that direction", function()
+      set_pr("bbb2222full")
+      stub_jj({})
+      local selected = false
+      init.select_commit = function() selected = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.is_false(selected)
+      assert.is_truthy(table.concat(notifications, "\n"):find("no descendant"))
+    end)
+
+    it("loads the PR that owns the child commit and filters to it", function()
+      set_pr("bbb2222full")
+      stub_jj({ { commit_id = "ccc3333full", bookmarks = { "feat/two" }, description = "third" } })
+      state.set_active_commit({ sha = "bbb2222", oid = "bbb2222full", message = "second", author = "dev" })
+
+      local bookmark_rev
+      vcs.jj_downstream_bookmarks = function(rev, cb)
+        bookmark_rev = rev
+        cb(nil, { "feat/two" })
+      end
+      local branches
+      gh.pr_view_branch = function(list, cb)
+        branches = list
+        cb(nil, { number = 43, title = "Second PR" })
+      end
+
+      local loaded_number
+      init._load_pr_data = function(number, cb)
+        loaded_number = number
+        -- The new PR's commits replace the old ones before the callback runs
+        state.set_commits({ { sha = "ccc3333", oid = "ccc3333full", message = "third", author = "dev" } })
+        cb()
+      end
+      local selected
+      init.select_commit = function(commit) selected = commit end
+
+      local orig_notify = vim.notify
+      vim.notify = function() end
+      init.next_stack_commit()
+      vim.notify = orig_notify
+
+      assert.are.equal("ccc3333full", bookmark_rev)
+      assert.are.same({ "feat/two" }, branches)
+      assert.are.equal(43, loaded_number)
+      assert.are.equal("ccc3333full", selected.oid)
+      -- The previous PR's commit filter must not leak into the new PR
+      assert.is_nil(state.get_active_commit())
+    end)
+
+    it("shows the whole PR when the child is not among its commits", function()
+      set_pr("bbb2222full")
+      stub_jj({ { commit_id = "ccc3333full", bookmarks = {}, description = "third" } })
+      vcs.jj_downstream_bookmarks = function(_, cb) cb(nil, { "feat/two" }) end
+      gh.pr_view_branch = function(_, cb) cb(nil, { number = 43, title = "Second PR" }) end
+      init._load_pr_data = function(_, cb) cb() end
+      local selected = false
+      init.select_commit = function() selected = true end
+      local refreshed = false
+      init._refresh_views = function() refreshed = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.is_false(selected)
+      assert.is_true(refreshed)
+      assert.is_truthy(table.concat(notifications, "\n"):find("not part of it"))
+    end)
+
+    it("warns when the child commit has no bookmark to identify a PR by", function()
+      set_pr("bbb2222full")
+      stub_jj({ { commit_id = "ccc3333full", bookmarks = {}, description = "third" } })
+      vcs.jj_downstream_bookmarks = function(_, cb) cb(nil, {}) end
+      local looked_up = false
+      gh.pr_view_branch = function() looked_up = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.is_false(looked_up)
+      assert.is_truthy(table.concat(notifications, "\n"):find("no bookmark"))
+    end)
+
+    it("does not reload the PR already loaded", function()
+      set_pr("bbb2222full")
+      stub_jj({ { commit_id = "ccc3333full", bookmarks = { "f" }, description = "unpushed" } })
+      vcs.jj_downstream_bookmarks = function(_, cb) cb(nil, { "f" }) end
+      gh.pr_view_branch = function(_, cb) cb(nil, { number = 42, title = "T" }) end
+      local loaded = false
+      init._load_pr_data = function() loaded = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.next_stack_commit()
+
+      vim.notify = orig_notify
+      assert.is_false(loaded)
+      assert.is_truthy(table.concat(notifications, "\n"):find("unpushed"))
+    end)
+
+    it("asks which neighbour to follow when the stack forks", function()
+      set_pr("bbb2222full")
+      stub_jj({
+        { commit_id = "ccc3333full", bookmarks = { "feat/a" }, description = "branch a" },
+        { commit_id = "ddd4444full", bookmarks = {}, description = "branch b" },
+      })
+
+      local choices, formatted
+      local orig_select = vim.ui.select
+      vim.ui.select = function(items, opts, on_choice)
+        choices = items
+        formatted = opts.format_item(items[1])
+        on_choice(items[2])
+      end
+      state.set_commits({ { sha = "ddd4444", oid = "ddd4444full", message = "branch b", author = "dev" } })
+      local selected
+      init.select_commit = function(commit) selected = commit end
+
+      init.next_stack_commit()
+
+      vim.ui.select = orig_select
+      assert.are.equal(2, #choices)
+      assert.is_truthy(formatted:find("feat/a", 1, true))
+      assert.are.equal("ddd4444full", selected.oid)
+    end)
+  end)
+
+  describe("stack_panel", function()
+    local vcs = require("gh-review.vcs")
+    local orig_vcs = {}
+    local shown
+
+    --- Stub the stack picker UI; `closed` decides whether one was already open.
+    local function stub_ui(closed)
+      shown = nil
+      package.loaded["gh-review.ui.stack"] = {
+        close = function() return closed == true end,
+        show = function(commits, opts) shown = { commits = commits, opts = opts } end,
+      }
+    end
+
+    before_each(function()
+      orig_vcs.jj_root = vcs.jj_root
+      orig_vcs.jj_stack = vcs.jj_stack
+      orig_vcs.head_rev = vcs.head_rev
+      orig_vcs.jj_change_id = vcs.jj_change_id
+      orig_vcs.jj_change_ids = vcs.jj_change_ids
+      stub_ui(false)
+      vcs.jj_root = function() return "/tmp/ws" end
+      -- Change ids are derived from the revision so assertions stay readable
+      vcs.jj_change_id = function(rev, cb) cb(nil, "change-" .. rev) end
+      vcs.jj_change_ids = function(revs, cb)
+        local ids = {}
+        for _, rev in ipairs(revs) do
+          table.insert(ids, "change-" .. rev)
+        end
+        cb(nil, ids)
+      end
+    end)
+
+    after_each(function()
+      for name, fn in pairs(orig_vcs) do
+        vcs[name] = fn
+      end
+      orig_vcs = {}
+      package.loaded["gh-review.ui.stack"] = nil
+    end)
+
+    it("closes an open picker instead of reloading the stack", function()
+      stub_ui(true)
+      local queried = false
+      vcs.jj_stack = function() queried = true end
+
+      init.stack_panel()
+
+      assert.is_false(queried)
+      assert.is_nil(shown)
+    end)
+
+    it("warns when the repo is not a jj workspace", function()
+      vcs.jj_root = function() return nil end
+      local queried = false
+      vcs.jj_stack = function() queried = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.stack_panel()
+
+      vim.notify = orig_notify
+      assert.is_false(queried)
+      assert.is_truthy(notifications[1]:find("jj workspace"))
+    end)
+
+    it("anchors on the commit under review, the PR head and its branch", function()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m", head_ref = "feat/one",
+        head_sha = "bbb2222full", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+      state.set_active_commit({ sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" })
+      local asked
+      vcs.jj_stack = function(anchor, cb)
+        asked = anchor
+        cb(nil, { { commit_id = "aaa1111full", bookmarks = {}, description = "first" } }, false)
+      end
+
+      init.stack_panel()
+
+      -- The head branch must be in there: anchoring on the pushed oid alone
+      -- misses the descendants once the commit has been rewritten locally
+      assert.are.same({ "aaa1111full", "bbb2222full" }, asked.revs)
+      assert.are.same({ "feat/one" }, asked.bookmarks)
+      assert.are.equal(1, #shown.commits)
+      assert.are.equal("aaa1111full", shown.opts.current_oid)
+      assert.is_false(shown.opts.truncated)
+    end)
+
+    it("hands the picker the changes of the commit under review and of the PR", function()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m", head_ref = "feat/one",
+        head_sha = "bbb2222full", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+      state.set_commits({
+        { sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" },
+        { sha = "bbb2222", oid = "bbb2222full", message = "second", author = "dev" },
+      })
+      state.set_active_commit({ sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" })
+      local resolved
+      vcs.jj_change_ids = function(revs, cb)
+        resolved = revs
+        cb(nil, { "change-aaa1111full", "change-bbb2222full" })
+      end
+      vcs.jj_stack = function(_, cb)
+        cb(nil, { { commit_id = "zzz", change_id = "change-aaa1111full", bookmarks = {}, description = "first" } }, false)
+      end
+
+      init.stack_panel()
+
+      -- Every PR commit is resolved, so a rewritten stack still gets its badges
+      assert.are.same({ "aaa1111full", "bbb2222full" }, resolved)
+      assert.are.equal("change-aaa1111full", shown.opts.current_change_id)
+      assert.are.same(
+        { ["change-aaa1111full"] = true, ["change-bbb2222full"] = true },
+        shown.opts.pr_change_ids
+      )
+    end)
+
+    it("still opens the picker when the changes cannot be resolved", function()
+      vcs.head_rev = function() return "wwww9999" end
+      vcs.jj_change_id = function(_, cb) cb("boom", nil) end
+      vcs.jj_change_ids = function(_, cb) cb("boom", nil) end
+      vcs.jj_stack = function(_, cb)
+        cb(nil, { { commit_id = "wwww9999", change_id = "cccc", bookmarks = {}, description = "wip" } }, false)
+      end
+
+      init.stack_panel()
+
+      assert.are.equal(1, #shown.commits)
+      assert.is_nil(shown.opts.current_change_id)
+      assert.are.same({}, shown.opts.pr_change_ids)
+    end)
+
+    it("works without an active review, anchoring on the working copy", function()
+      vcs.head_rev = function() return "wwww9999" end
+      local asked
+      vcs.jj_stack = function(anchor, cb)
+        asked = anchor
+        cb(nil, { { commit_id = "wwww9999", bookmarks = { "feat/a" }, description = "wip" } }, true)
+      end
+
+      init.stack_panel()
+
+      assert.are.same({ "wwww9999" }, asked.revs)
+      assert.are.same({}, asked.bookmarks)
+      assert.is_true(shown.opts.truncated)
+    end)
+
+    it("errors when the current revision cannot be resolved", function()
+      vcs.head_rev = function() return nil end
+      local queried = false
+      vcs.jj_stack = function() queried = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.stack_panel()
+
+      vim.notify = orig_notify
+      assert.is_false(queried)
+      assert.is_truthy(notifications[1]:find("jj revision"))
+    end)
+
+    it("reports an empty stack instead of opening the picker", function()
+      vcs.head_rev = function() return "wwww9999" end
+      vcs.jj_stack = function(_, cb) cb(nil, {}, false) end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.stack_panel()
+
+      vim.notify = orig_notify
+      assert.is_nil(shown)
+      assert.is_truthy(notifications[1]:find("no commits"))
+    end)
+
+    it("surfaces jj failures", function()
+      vcs.head_rev = function() return "wwww9999" end
+      vcs.jj_stack = function(_, cb) cb("bad revset") end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.stack_panel()
+
+      vim.notify = orig_notify
+      assert.is_nil(shown)
+      assert.is_truthy(notifications[1]:find("bad revset"))
+    end)
+
+    it("routes a selection through the shared stack navigation", function()
+      vcs.head_rev = function() return "wwww9999" end
+      local picked = { commit_id = "ccc3333full", bookmarks = {}, description = "third" }
+      vcs.jj_stack = function(_, cb) cb(nil, { picked }, false) end
+      local navigated
+      init._goto_stack_commit = function(commit) navigated = commit end
+
+      init.stack_panel()
+      shown.opts.on_select(picked)
+
+      assert.are.equal("ccc3333full", navigated.commit_id)
     end)
   end)
 
@@ -1357,6 +1896,627 @@ describe("init", function()
       local found = false
       for _, n in ipairs(notifications) do
         if n.msg:find("PR node ID not available") then found = true end
+      end
+      assert.is_true(found)
+    end)
+  end)
+
+  describe("new_thread_direct", function()
+    --- Active PR with everything a direct comment needs. `head_sha` is passed
+    --- explicitly because vim.tbl_extend cannot override a key back to nil.
+    ---@param head_sha? string
+    local function set_pr(head_sha)
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m",
+        head_ref = "f", head_sha = head_sha, url = "", body = "",
+        review_decision = "", repository = "o/r",
+      })
+    end
+
+    local orig_rel_path
+
+    before_each(function()
+      orig_rel_path = init._current_rel_path
+      init._current_rel_path = function() return "src/a.lua" end
+    end)
+
+    after_each(function()
+      init._current_rel_path = orig_rel_path
+      package.loaded["gh-review.ui.comment_input"] = nil
+    end)
+
+    it("notifies when no active review", function()
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.new_thread_direct()
+
+      vim.notify = orig_notify
+      assert.is_truthy(notifications[1].msg:find("no active review"))
+    end)
+
+    it("notifies when the PR head commit is unknown", function()
+      set_pr(nil)
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.new_thread_direct(5)
+
+      vim.notify = orig_notify
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("head commit not available") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("posts the comment immediately instead of creating a pending thread", function()
+      set_pr("HEADSHA")
+
+      local captured_opts
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) captured_opts = opts end,
+      }
+
+      local rest_args, thread_created = nil, false
+      gh.pr_add_review_comment = function(pr_number, opts, cb)
+        rest_args = { pr_number = pr_number, opts = opts }
+        cb(nil)
+      end
+      graphql.create_thread = function() thread_created = true end
+      init.refresh = function() end
+
+      init.new_thread_direct(12)
+      assert.is_truthy(captured_opts.title:find("Direct Comment: src/a.lua:12", 1, true))
+      captured_opts.on_submit("looks wrong")
+
+      assert.is_false(thread_created)
+      assert.are.equal(42, rest_args.pr_number)
+      assert.are.equal("o/r", rest_args.opts.repo)
+      assert.are.equal("HEADSHA", rest_args.opts.commit_id)
+      assert.are.equal("src/a.lua", rest_args.opts.path)
+      assert.are.equal("looks wrong", rest_args.opts.body)
+      assert.are.equal(12, rest_args.opts.line)
+      assert.are.equal(12, rest_args.opts.start_line)
+      assert.are.equal("RIGHT", rest_args.opts.side)
+    end)
+
+    it("passes a visual range through as start_line/line", function()
+      set_pr("HEADSHA")
+
+      local captured_opts
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) captured_opts = opts end,
+      }
+      local rest_opts
+      gh.pr_add_review_comment = function(_, opts, cb)
+        rest_opts = opts
+        cb(nil)
+      end
+      init.refresh = function() end
+
+      init.new_thread_direct(7, 9)
+      assert.is_truthy(captured_opts.title:find("src/a.lua:7-9", 1, true))
+      captured_opts.on_submit("range comment")
+
+      assert.are.equal(7, rest_opts.start_line)
+      assert.are.equal(9, rest_opts.line)
+    end)
+
+    it("reports a failed post and does not refresh", function()
+      set_pr("HEADSHA")
+
+      local captured_opts
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) captured_opts = opts end,
+      }
+      gh.pr_add_review_comment = function(_, _, cb) cb("line must be part of the diff") end
+      local refreshed = false
+      init.refresh = function() refreshed = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.new_thread_direct(3)
+      captured_opts.on_submit("b")
+
+      vim.notify = orig_notify
+      assert.is_false(refreshed)
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("failed to post comment") then found = true end
+      end
+      assert.is_true(found)
+    end)
+  end)
+
+  describe("pending_review / submit_review", function()
+    local function set_pr()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m",
+        head_ref = "f", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+    end
+
+    local function make_pending()
+      return {
+        id = "PRR_1",
+        total_count = 2,
+        comments = {
+          { path = "src/a.lua", line = 5, body = "nit" },
+          { path = "src/b.lua", line = 8, body = "why?" },
+        },
+      }
+    end
+
+    after_each(function()
+      package.loaded["gh-review.ui.review_submit"] = nil
+      package.loaded["gh-review.ui.comment_input"] = nil
+    end)
+
+    it("notifies when no active review", function()
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.pending_review()
+
+      vim.notify = orig_notify
+      assert.is_truthy(notifications[1].msg:find("no active review"))
+    end)
+
+    it("shows the panel with the pending review", function()
+      set_pr()
+      local captured_owner, captured_repo, captured_number
+      graphql.fetch_pending_review = function(owner, repo, number, cb)
+        captured_owner, captured_repo, captured_number = owner, repo, number
+        cb(nil, make_pending())
+      end
+
+      local shown
+      package.loaded["gh-review.ui.review_submit"] = {
+        show = function(review) shown = review end,
+      }
+
+      init.pending_review()
+
+      assert.are.equal("o", captured_owner)
+      assert.are.equal("r", captured_repo)
+      assert.are.equal(42, captured_number)
+      assert.are.equal("PRR_1", shown.id)
+    end)
+
+    it("reports when nothing is pending instead of opening the panel", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, nil) end
+
+      local opened = false
+      package.loaded["gh-review.ui.review_submit"] = {
+        show = function() opened = true end,
+      }
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.pending_review()
+
+      vim.notify = orig_notify
+      assert.is_false(opened)
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("no unsubmitted comments") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("treats an empty pending review as nothing pending", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb)
+        cb(nil, { id = "PRR_1", comments = {}, total_count = 0 })
+      end
+
+      local opened = false
+      package.loaded["gh-review.ui.review_submit"] = {
+        show = function() opened = true end,
+      }
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.pending_review()
+
+      vim.notify = orig_notify
+      assert.is_false(opened)
+    end)
+
+    it("submits the review with the event chosen in the panel", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, make_pending()) end
+
+      local panel_opts
+      package.loaded["gh-review.ui.review_submit"] = {
+        show = function(_, opts) panel_opts = opts end,
+      }
+      local input_opts
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) input_opts = opts end,
+      }
+      local submitted
+      graphql.submit_review = function(review_id, event, body, cb)
+        submitted = { review_id = review_id, event = event, body = body }
+        cb(nil, { state = "APPROVED" })
+      end
+      init.refresh = function() end
+
+      init.pending_review()
+      panel_opts.on_submit("APPROVE")
+
+      assert.is_truthy(input_opts.title:find("Approve", 1, true))
+      assert.is_truthy(input_opts.title:find("2 comments", 1, true))
+      -- Approving without a summary is allowed
+      assert.is_true(input_opts.allow_empty)
+      input_opts.on_submit("")
+
+      assert.are.equal("PRR_1", submitted.review_id)
+      assert.are.equal("APPROVE", submitted.event)
+      assert.are.equal("", submitted.body)
+    end)
+
+    it("requires a summary for events other than approve", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, make_pending()) end
+
+      local panel_opts
+      package.loaded["gh-review.ui.review_submit"] = {
+        show = function(_, opts) panel_opts = opts end,
+      }
+      local input_opts
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) input_opts = opts end,
+      }
+
+      init.pending_review()
+      panel_opts.on_submit("REQUEST_CHANGES")
+
+      assert.is_falsy(input_opts.allow_empty)
+      assert.is_truthy(input_opts.title:find("Request changes", 1, true))
+    end)
+
+    it("jumps to a comment from the panel", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, make_pending()) end
+
+      local panel_opts
+      package.loaded["gh-review.ui.review_submit"] = {
+        show = function(_, opts) panel_opts = opts end,
+      }
+      local opened
+      init._open_file = function(path, line) opened = { path = path, line = line } end
+
+      init.pending_review()
+      panel_opts.on_jump({ path = "src/b.lua", line = 8 })
+
+      assert.are.same({ path = "src/b.lua", line = 8 }, opened)
+    end)
+
+    it("maps command arguments to review events", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, make_pending()) end
+      local input_opts
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) input_opts = opts end,
+      }
+      local events = {}
+      graphql.submit_review = function(_, event, _, cb)
+        table.insert(events, event)
+        cb(nil, {})
+      end
+      init.refresh = function() end
+
+      -- `false` stands in for "no argument" so ipairs doesn't stop at a nil
+      for _, arg in ipairs({ false, "comment", "approve", "request-changes" }) do
+        init.submit_review(arg or nil)
+        input_opts.on_submit("summary")
+      end
+
+      assert.are.same({ "COMMENT", "COMMENT", "APPROVE", "REQUEST_CHANGES" }, events)
+    end)
+
+    it("rejects an unknown review event", function()
+      set_pr()
+      local fetched = false
+      graphql.fetch_pending_review = function(_, _, _, cb)
+        fetched = true
+        cb(nil, make_pending())
+      end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.submit_review("merge")
+
+      vim.notify = orig_notify
+      assert.is_false(fetched)
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("unknown review event") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("reports a failed submit and does not refresh", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, make_pending()) end
+      graphql.submit_review = function(_, _, _, cb) cb("Can not approve your own pull request", nil) end
+      local input_opts
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) input_opts = opts end,
+      }
+      local refreshed = false
+      init.refresh = function() refreshed = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.submit_review("approve")
+      input_opts.on_submit("")
+
+      vim.notify = orig_notify
+      assert.is_false(refreshed)
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("submit failed") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("reports a failed pending-review fetch", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb("bad credentials", nil) end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.pending_review()
+
+      vim.notify = orig_notify
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("failed to fetch pending review") then found = true end
+      end
+      assert.is_true(found)
+    end)
+  end)
+
+  describe("review_pr", function()
+    local function set_pr()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m", head_ref = "f",
+        url = "", body = "", review_decision = "", repository = "o/r", node_id = "PR_1",
+      })
+    end
+
+    --- Stub the comment input and return a getter for the opts it was opened with
+    local function stub_input()
+      local captured
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) captured = opts end,
+      }
+      return function() return captured end
+    end
+
+    after_each(function()
+      package.loaded["gh-review.ui.comment_input"] = nil
+    end)
+
+    it("notifies when no active review", function()
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.review_pr("approve")
+
+      vim.notify = orig_notify
+      assert.is_truthy(notifications[1].msg:find("no active review"))
+    end)
+
+    it("creates a fresh review when nothing is pending", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, nil) end
+      local input = stub_input()
+      local created
+      graphql.create_review = function(pr_id, event, body, cb)
+        created = { pr_id = pr_id, event = event, body = body }
+        cb(nil, { state = "APPROVED" })
+      end
+      local submitted = false
+      graphql.submit_review = function() submitted = true end
+      init.refresh = function() end
+
+      init.review_pr("approve")
+
+      local opts = input()
+      assert.is_truthy(opts.title:find("Review PR #42", 1, true))
+      assert.is_truthy(opts.title:find("Approve", 1, true))
+      -- Nothing pending, so no mention of comments being published along with it
+      assert.is_nil(opts.title:find("pending comment", 1, true))
+      assert.is_true(opts.allow_empty)
+
+      opts.on_submit("")
+
+      assert.is_false(submitted)
+      assert.are.same({ pr_id = "PR_1", event = "APPROVE", body = "" }, created)
+    end)
+
+    it("submits the pending review instead of creating a second one", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb)
+        cb(nil, { id = "PRR_1", total_count = 1, comments = { { path = "src/a.lua", line = 5, body = "nit" } } })
+      end
+      local input = stub_input()
+      local created = false
+      graphql.create_review = function() created = true end
+      local submitted
+      graphql.submit_review = function(review_id, event, body, cb)
+        submitted = { review_id = review_id, event = event, body = body }
+        cb(nil, {})
+      end
+      init.refresh = function() end
+
+      init.review_pr("request-changes")
+
+      local opts = input()
+      assert.is_truthy(opts.title:find("Request changes", 1, true))
+      assert.is_truthy(opts.title:find("also publishes 1 pending comment", 1, true))
+      -- GitHub rejects a bodyless "request changes"
+      assert.is_falsy(opts.allow_empty)
+
+      opts.on_submit("needs work")
+
+      assert.is_false(created)
+      assert.are.same({ review_id = "PRR_1", event = "REQUEST_CHANGES", body = "needs work" }, submitted)
+    end)
+
+    it("asks which verdict to give when no event is passed", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, nil) end
+      local input = stub_input()
+      local events = {}
+      graphql.create_review = function(_, event, _, cb)
+        table.insert(events, event)
+        cb(nil, {})
+      end
+      init.refresh = function() end
+
+      local captured_items, captured_format
+      local orig_select = vim.ui.select
+      vim.ui.select = function(items, opts, on_choice)
+        captured_items, captured_format = items, opts.format_item
+        on_choice("COMMENT")
+      end
+
+      init.review_pr()
+      vim.ui.select = orig_select
+
+      assert.are.same({ "APPROVE", "COMMENT", "REQUEST_CHANGES" }, captured_items)
+      assert.are.equal("Request changes", captured_format("REQUEST_CHANGES"))
+      input().on_submit("some thoughts")
+      assert.are.same({ "COMMENT" }, events)
+    end)
+
+    it("does nothing when the verdict picker is dismissed", function()
+      set_pr()
+      local fetched = false
+      graphql.fetch_pending_review = function(_, _, _, cb)
+        fetched = true
+        cb(nil, nil)
+      end
+
+      local orig_select = vim.ui.select
+      vim.ui.select = function(_, _, on_choice) on_choice(nil) end
+
+      init.review_pr()
+      vim.ui.select = orig_select
+
+      assert.is_false(fetched)
+    end)
+
+    it("rejects an unknown review event", function()
+      set_pr()
+      local fetched = false
+      graphql.fetch_pending_review = function(_, _, _, cb)
+        fetched = true
+        cb(nil, nil)
+      end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.review_pr("merge")
+
+      vim.notify = orig_notify
+      assert.is_false(fetched)
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("unknown review event") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("reports a failed submit and does not refresh", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb(nil, nil) end
+      graphql.create_review = function(_, _, _, cb) cb("Can not approve your own pull request", nil) end
+      local input = stub_input()
+      local refreshed = false
+      init.refresh = function() refreshed = true end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.review_pr("approve")
+      input().on_submit("")
+
+      vim.notify = orig_notify
+      assert.is_false(refreshed)
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("submit failed") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("reports a failed pending-review fetch without opening the input", function()
+      set_pr()
+      graphql.fetch_pending_review = function(_, _, _, cb) cb("bad credentials", nil) end
+      local input = stub_input()
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.review_pr("comment")
+
+      vim.notify = orig_notify
+      assert.is_nil(input())
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("failed to fetch pending review") then found = true end
+      end
+      assert.is_true(found)
+    end)
+
+    it("reports a missing PR node ID", function()
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "m", head_ref = "f",
+        url = "", body = "", review_decision = "", repository = "o/r",
+      })
+      local fetched = false
+      graphql.fetch_pending_review = function(_, _, _, cb)
+        fetched = true
+        cb(nil, nil)
+      end
+
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notifications, { msg = msg, level = level }) end
+
+      init.review_pr("approve")
+
+      vim.notify = orig_notify
+      assert.is_false(fetched)
+      local found = false
+      for _, n in ipairs(notifications) do
+        if n.msg:find("node ID not available") then found = true end
       end
       assert.is_true(found)
     end)
@@ -1769,6 +2929,25 @@ describe("init", function()
       assert.is_nil(opened)
     end)
 
+    it("follows the sidebar order, not the order files were loaded in", function()
+      local cwd = vim.fn.getcwd()
+      -- Sidebar shows directories first: src/x.lua, then top.lua.
+      state.set_files({
+        { path = "top.lua", status = "modified" },
+        { path = "src/x.lua", status = "modified" },
+      })
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, cwd .. "/src/x.lua")
+      vim.api.nvim_set_current_buf(buf)
+
+      local opened
+      init._open_file = function(path) opened = path end
+
+      init.next_file()
+      assert.are.equal("top.lua", opened)
+    end)
+
     it("notifies at the last file", function()
       local cwd = vim.fn.getcwd()
       local buf = vim.api.nvim_create_buf(false, true)
@@ -1790,6 +2969,134 @@ describe("init", function()
         if m:find("last file") then warned = true end
       end
       assert.is_true(warned)
+    end)
+  end)
+
+  describe("next_diff / prev_diff crossing files", function()
+    local orig_minidiff
+    local goto_calls
+    local bufs
+
+    --- Put the cursor on a PR file so _current_rel_path() resolves to it.
+    --- Reuses a buffer of that name if an earlier test left one behind.
+    ---@param rel string
+    local function sit_on(rel)
+      local name = vim.fn.getcwd() .. "/" .. rel
+      local buf = vim.fn.bufnr(name)
+      if buf == -1 then
+        buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_buf_set_name(buf, name)
+      end
+      vim.api.nvim_set_current_buf(buf)
+      table.insert(bufs, buf)
+      return buf
+    end
+
+    --- Stub mini.diff. goto_hunk records the direction and never moves the
+    --- cursor (so navigate_diff treats the current file as exhausted), and
+    --- hunks only appear after `hunks_after` polls — the real plugin computes
+    --- them on a timer, several event-loop ticks after the buffer is attached.
+    ---@param hunks_after number
+    local function stub_minidiff(hunks_after)
+      local polls = 0
+      package.loaded["mini.diff"] = {
+        goto_hunk = function(dir) table.insert(goto_calls, dir) end,
+        get_buf_data = function()
+          polls = polls + 1
+          if polls < hunks_after then return { hunks = {} } end
+          return { hunks = { { buf_start = 5, buf_count = 2 } } }
+        end,
+      }
+    end
+
+    before_each(function()
+      orig_minidiff = package.loaded["mini.diff"]
+      goto_calls = {}
+      bufs = {}
+      state.set_pr({
+        number = 42, title = "T", author = "a", base_ref = "main",
+        head_ref = "f", url = "", body = "", review_decision = "", repository = "o/r",
+      })
+      state.set_files({
+        { path = "src/a.lua", status = "modified" },
+        { path = "src/b.lua", status = "modified" },
+      })
+      state.set_view_mode("inline")
+    end)
+
+    after_each(function()
+      package.loaded["mini.diff"] = orig_minidiff
+      for _, buf in ipairs(bufs) do
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end
+    end)
+
+    it("lands on the next file's first hunk once mini.diff has hunks", function()
+      stub_minidiff(3)
+      sit_on("src/a.lua")
+
+      local opened
+      init._open_file = function(path) opened = path end
+
+      init.next_diff()
+      assert.are.equal("src/b.lua", opened)
+      vim.wait(500, function() return #goto_calls >= 2 end)
+      assert.are.same({ "next", "first" }, goto_calls)
+    end)
+
+    it("lands on the previous file's last hunk", function()
+      stub_minidiff(1)
+      sit_on("src/b.lua")
+
+      local opened
+      init._open_file = function(path) opened = path end
+
+      init.prev_diff()
+      assert.are.equal("src/a.lua", opened)
+      vim.wait(500, function() return #goto_calls >= 2 end)
+      assert.are.same({ "prev", "last" }, goto_calls)
+    end)
+
+    it("opens an added file at the top instead of hunting for hunks", function()
+      state.set_files({
+        { path = "src/a.lua", status = "modified" },
+        { path = "src/added.lua", status = "added" },
+      })
+      stub_minidiff(1)
+      local buf = sit_on("src/a.lua")
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "one", "two", "three" })
+      vim.api.nvim_win_set_cursor(0, { 3, 0 })
+
+      local opened
+      init._open_file = function(path) opened = path end
+
+      init.next_diff()
+      assert.are.equal("src/added.lua", opened)
+      assert.are.same({ "next" }, goto_calls)
+      assert.are.equal(1, vim.api.nvim_win_get_cursor(0)[1])
+    end)
+
+    it("stops waiting for hunks when the user moves to another buffer", function()
+      local elsewhere = vim.api.nvim_create_buf(false, true)
+      table.insert(bufs, elsewhere)
+
+      local polls = 0
+      package.loaded["mini.diff"] = {
+        goto_hunk = function(dir) table.insert(goto_calls, dir) end,
+        get_buf_data = function()
+          polls = polls + 1
+          -- User navigates away while we're still waiting for the diff.
+          vim.api.nvim_set_current_buf(elsewhere)
+          return { hunks = {} }
+        end,
+      }
+      sit_on("src/a.lua")
+      init._open_file = function() end
+
+      init.next_diff()
+      vim.wait(100)
+      assert.are.equal(1, polls)
+      assert.are.same({ "next" }, goto_calls)
     end)
   end)
 end)

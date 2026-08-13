@@ -138,18 +138,63 @@ describe("commits", function()
       assert.are.equal("abc", formatted[2][1])
     end)
 
-    it("format function shows > prefix for active commit", function()
+    it("format function highlights the whole entry of the active commit", function()
+      local picker_util = require("gh-review.ui.picker_util")
       state.set_commits({
         { sha = "abc", oid = "abcfull", message = "fix", author = "dev", date = "" },
+        { sha = "def", oid = "deffull", message = "other", author = "dev", date = "" },
       })
       state.set_active_commit({ sha = "abc", oid = "abcfull", message = "fix", author = "dev" })
 
       commits_ui.show()
 
-      local item = picker_config.items[1]
-      local formatted = picker_config.format(item)
+      local formatted = picker_config.format(picker_config.items[1])
       assert.are.equal("> ", formatted[1][1])
-      assert.are.equal("CurSearch", formatted[1][2])
+      assert.are.equal(picker_util.ACTIVE, formatted[1][2])
+      -- sha, message and metadata all carry the highlight, not just the marker
+      assert.are.equal(picker_util.ACTIVE_ENTRY, formatted[2][2])
+      assert.are.equal(picker_util.ACTIVE_ENTRY, formatted[3][2])
+      assert.are.equal(picker_util.ACTIVE_ENTRY, formatted[4][2])
+
+      -- Other entries keep their ordinary highlights
+      local other = picker_config.format(picker_config.items[2])
+      assert.are.equal("Identifier", other[2][2])
+      assert.is_nil(other[3][2])
+      assert.are.equal("Comment", other[4][2])
+    end)
+
+    it("opens on the active commit", function()
+      state.set_commits({
+        { sha = "abc", oid = "abcfull", message = "first", author = "dev", date = "" },
+        { sha = "def", oid = "deffull", message = "second", author = "dev", date = "" },
+      })
+      state.set_active_commit({ sha = "def", oid = "deffull", message = "second", author = "dev" })
+
+      commits_ui.show()
+
+      local viewed
+      picker_config.on_show({
+        items = function() return picker_config.items end,
+        list = { view = function(_, idx) viewed = idx end },
+      })
+
+      assert.are.equal(2, viewed)
+    end)
+
+    it("leaves the cursor at the top when no commit is selected", function()
+      state.set_commits({
+        { sha = "abc", oid = "abcfull", message = "first", author = "dev", date = "" },
+      })
+
+      commits_ui.show()
+
+      local viewed
+      picker_config.on_show({
+        items = function() return picker_config.items end,
+        list = { view = function(_, idx) viewed = idx end },
+      })
+
+      assert.is_nil(viewed)
     end)
   end)
 end)

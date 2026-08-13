@@ -327,6 +327,243 @@ describe("graphql", function()
     end)
   end)
 
+  describe("fetch_pending_review", function()
+    --- Wrap pending review nodes in the response shape GitHub returns.
+    local function make_response(nodes)
+      return {
+        repository = {
+          pullRequest = {
+            reviews = { nodes = nodes or {} },
+          },
+        },
+      }
+    end
+
+    it("returns the pending review with its comments", function()
+      local captured_vars
+      gh.graphql = function(_, vars, cb)
+        captured_vars = vars
+        cb(nil, make_response({
+          {
+            id = "PRR_1",
+            url = "https://github.com/o/r/pull/1#pullrequestreview-1",
+            body = "summary so far",
+            comments = {
+              totalCount = 2,
+              nodes = {
+                { id = "C1", path = "a.lua", line = 5, startLine = 3, body = "nit", outdated = false },
+                { id = "C2", path = "b.lua", line = 9, body = "question", outdated = true },
+              },
+            },
+          },
+        }))
+      end
+
+      local result
+      graphql.fetch_pending_review("owner", "repo", 12, function(err, review)
+        assert.is_nil(err)
+        result = review
+      end)
+
+      assert.are.equal("owner", captured_vars.owner)
+      assert.are.equal(12, captured_vars.number)
+      assert.are.equal("PRR_1", result.id)
+      assert.are.equal("summary so far", result.body)
+      assert.are.equal(2, result.total_count)
+      assert.are.equal(2, #result.comments)
+      assert.are.equal("a.lua", result.comments[1].path)
+      assert.are.equal(5, result.comments[1].line)
+      assert.are.equal(3, result.comments[1].start_line)
+      assert.is_false(result.comments[1].is_outdated)
+      assert.is_true(result.comments[2].is_outdated)
+      assert.is_nil(result.comments[2].start_line)
+    end)
+
+    it("returns nil when nothing is pending", function()
+      gh.graphql = function(_, _, cb)
+        cb(nil, make_response({}))
+      end
+
+      local called, result = false, "unset"
+      graphql.fetch_pending_review("o", "r", 1, function(err, review)
+        assert.is_nil(err)
+        called = true
+        result = review
+      end)
+
+      assert.is_true(called)
+      assert.is_nil(result)
+    end)
+
+    it("falls back to the original line for outdated comments", function()
+      gh.graphql = function(_, _, cb)
+        cb(nil, make_response({
+          {
+            id = "PRR_2",
+            comments = {
+              totalCount = 1,
+              nodes = {
+                {
+                  id = "C1",
+                  path = "a.lua",
+                  -- GraphQL nulls decode to vim.NIL, which is truthy in Lua
+                  line = vim.NIL,
+                  originalLine = 40,
+                  startLine = vim.NIL,
+                  originalStartLine = 38,
+                  body = "stale",
+                  outdated = true,
+                },
+              },
+            },
+          },
+        }))
+      end
+
+      local result
+      graphql.fetch_pending_review("o", "r", 1, function(_, review) result = review end)
+
+      assert.are.equal(40, result.comments[1].line)
+      assert.are.equal(38, result.comments[1].start_line)
+    end)
+
+    it("reports the true total when more than a page is pending", function()
+      gh.graphql = function(_, _, cb)
+        cb(nil, make_response({
+          { id = "PRR_3", comments = { totalCount = 130, nodes = { { id = "C1", path = "a", line = 1, body = "x" } } } },
+        }))
+      end
+
+      local result
+      graphql.fetch_pending_review("o", "r", 1, function(_, review) result = review end)
+
+      assert.are.equal(130, result.total_count)
+      assert.are.equal(1, #result.comments)
+    end)
+
+    it("passes through error", function()
+      gh.graphql = function(_, _, cb)
+        cb("bad credentials", nil)
+      end
+
+      local result_err
+      graphql.fetch_pending_review("o", "r", 1, function(err, _) result_err = err end)
+
+      assert.are.equal("bad credentials", result_err)
+    end)
+  end)
+
+  describe("submit_review", function()
+    it("sends the review ID, event and body", function()
+      local captured_query, captured_vars
+      gh.graphql = function(query, vars, cb)
+        captured_query = query
+        captured_vars = vars
+        cb(nil, { submitPullRequestReview = { pullRequestReview = { id = "PRR_1", state = "COMMENTED" } } })
+      end
+
+      local result
+      graphql.submit_review("PRR_1", "COMMENT", "looks good overall", function(err, review)
+        assert.is_nil(err)
+        result = review
+      end)
+
+      assert.are.equal("PRR_1", captured_vars.reviewId)
+      assert.are.equal("COMMENT", captured_vars.event)
+      assert.are.equal("looks good overall", captured_vars.body)
+      assert.is_truthy(captured_query:find("$body: String!", 1, true))
+      assert.are.equal("COMMENTED", result.state)
+    end)
+
+    it("omits the body entirely when empty", function()
+      local captured_query, captured_vars
+      gh.graphql = function(query, vars, cb)
+        captured_query = query
+        captured_vars = vars
+        cb(nil, {})
+      end
+
+      graphql.submit_review("PRR_1", "APPROVE", "", function() end)
+
+      assert.is_nil(captured_vars.body)
+      assert.is_nil(captured_query:find("body", 1, true))
+    end)
+
+    it("omits the body when it is nil", function()
+      local captured_vars
+      gh.graphql = function(_, vars, cb)
+        captured_vars = vars
+        cb(nil, {})
+      end
+
+      graphql.submit_review("PRR_1", "APPROVE", nil, function() end)
+
+      assert.is_nil(captured_vars.body)
+      assert.are.equal("APPROVE", captured_vars.event)
+    end)
+
+    it("passes through error", function()
+      gh.graphql = function(_, _, cb)
+        cb("Can not approve your own pull request", nil)
+      end
+
+      local result_err
+      graphql.submit_review("PRR_1", "APPROVE", nil, function(err, _) result_err = err end)
+
+      assert.is_truthy(result_err and result_err:find("own pull request", 1, true))
+    end)
+  end)
+
+  describe("create_review", function()
+    it("sends the PR ID, event and body, and submits right away", function()
+      local captured_query, captured_vars
+      gh.graphql = function(query, vars, cb)
+        captured_query = query
+        captured_vars = vars
+        cb(nil, { addPullRequestReview = { pullRequestReview = { id = "PRR_9", state = "APPROVED" } } })
+      end
+
+      local result
+      graphql.create_review("PR_1", "APPROVE", "ship it", function(err, review)
+        assert.is_nil(err)
+        result = review
+      end)
+
+      assert.are.equal("PR_1", captured_vars.pullRequestId)
+      assert.are.equal("APPROVE", captured_vars.event)
+      assert.are.equal("ship it", captured_vars.body)
+      assert.is_truthy(captured_query:find("addPullRequestReview", 1, true))
+      -- Without an event in the input the mutation would open a pending review
+      assert.is_truthy(captured_query:find("event: $event", 1, true))
+      assert.are.equal("APPROVED", result.state)
+    end)
+
+    it("omits the body entirely when empty", function()
+      local captured_query, captured_vars
+      gh.graphql = function(query, vars, cb)
+        captured_query = query
+        captured_vars = vars
+        cb(nil, {})
+      end
+
+      graphql.create_review("PR_1", "APPROVE", "", function() end)
+
+      assert.is_nil(captured_vars.body)
+      assert.is_nil(captured_query:find("body", 1, true))
+    end)
+
+    it("passes through error", function()
+      gh.graphql = function(_, _, cb)
+        cb("Can not approve your own pull request", nil)
+      end
+
+      local result_err
+      graphql.create_review("PR_1", "APPROVE", nil, function(err, _) result_err = err end)
+
+      assert.is_truthy(result_err and result_err:find("own pull request", 1, true))
+    end)
+  end)
+
   describe("fetch_pr_id", function()
     it("returns PR node ID from response", function()
       gh.graphql = function(query, vars, cb)

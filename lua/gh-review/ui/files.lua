@@ -32,12 +32,12 @@ local function status_display(status)
   return entry[1], entry[2]
 end
 
---- Build picker items with parent references for snacks tree rendering.
---- Collapses single-child directory chains (e.g. a/b/c → "a/b/c").
+--- Build the directory tree for a PR file list, collapsing single-child
+--- directory chains (e.g. a/b/c → "a/b/c"). Directory nodes have `children`,
+--- file nodes have `file`.
 ---@param files table[]
----@param cwd string
----@return table[] items
-local function build_items(files, cwd)
+---@return table root
+local function build_tree(files)
   -- First pass: build raw tree
   local root = { children = {} }
   for _, file in ipairs(files) do
@@ -82,22 +82,61 @@ local function build_items(files, cwd)
   end
   collapse(root)
 
+  return root
+end
+
+--- Children of a tree node in display order: directories first, then files,
+--- each group sorted by name.
+---@param node table
+---@return table[] children
+local function sorted_children(node)
+  local sorted = {}
+  for _, child in ipairs(node.children or {}) do
+    table.insert(sorted, child)
+  end
+  table.sort(sorted, function(a, b)
+    local a_dir = a.children and 0 or 1
+    local b_dir = b.children and 0 or 1
+    if a_dir ~= b_dir then return a_dir < b_dir end
+    return a.name < b.name
+  end)
+  return sorted
+end
+
+--- Flatten a PR file list into the top-to-bottom order the sidebar renders
+--- it in. Cross-file motions (`]d`/`[d`, `]f`/`[f`) walk this order so they
+--- visit files in the same sequence the user sees in the picker rather than
+--- the order the API happened to return them in.
+---@param files table[]
+---@return table[] files in display order
+function M.display_order(files)
+  local ordered = {}
+  local function walk(node)
+    for _, child in ipairs(sorted_children(node)) do
+      if child.children then
+        walk(child)
+      else
+        table.insert(ordered, child.file)
+      end
+    end
+  end
+  walk(build_tree(files))
+  return ordered
+end
+
+--- Build picker items with parent references for snacks tree rendering.
+---@param files table[]
+---@param cwd string
+---@return table[] items
+local function build_items(files, cwd)
+  local root = build_tree(files)
+
   -- Flatten into items with parent references
   local items = {}
 
   local function walk(node, parent_item)
     if not node.children then return end
-    -- Sort: directories first, then files
-    local sorted = {}
-    for _, child in ipairs(node.children) do
-      table.insert(sorted, child)
-    end
-    table.sort(sorted, function(a, b)
-      local a_dir = a.children and 0 or 1
-      local b_dir = b.children and 0 or 1
-      if a_dir ~= b_dir then return a_dir < b_dir end
-      return a.name < b.name
-    end)
+    local sorted = sorted_children(node)
 
     for idx, child in ipairs(sorted) do
       local is_dir = child.children ~= nil
@@ -135,6 +174,26 @@ local function get_picker()
   end
   local pickers = Snacks.picker.get({ source = "gh_review_files" })
   return pickers[1]
+end
+
+--- Move the picker cursor to the item matching a given PR-relative file path.
+--- No-op if the picker is not open or the path is not found.
+---@param rel_path string PR-relative file path
+function M.sync_selection(rel_path)
+  local picker = get_picker()
+  if not picker then return end
+  local cwd = vim.fn.getcwd()
+  local target = cwd .. "/" .. rel_path
+  local items = picker.list.items
+  if not items then return end
+  for i, item in ipairs(items) do
+    if item.file == target then
+      pcall(function()
+        picker.list:move(i, true)
+      end)
+      return
+    end
+  end
 end
 
 --- Toggle the file tree sidebar strictly open/close — no intermediate focus step.
@@ -221,7 +280,7 @@ function M.show()
     title = title,
     items = items,
     tree = true,
-    layout = { preset = "sidebar", preview = false },
+    layout = { preset = "sidebar", preview = false, layout = { position = "right" } },
     auto_close = false,
     jump = { close = false },
     on_show = initial_idx and function(picker)

@@ -22,19 +22,43 @@ vim.api.nvim_create_user_command("GHReview", function(opts)
     gh_review.show_hover()
   elseif cmd == "description" then
     gh_review.description()
+  elseif cmd == "pending" then
+    gh_review.pending_review()
+  elseif cmd == "submit" then
+    gh_review.submit_review(args[2])
+  elseif cmd == "review" then
+    gh_review.review_pr(args[2])
+  elseif cmd == "stack" then
+    gh_review.stack_panel()
+  elseif cmd == "stack-next" then
+    gh_review.next_stack_commit()
+  elseif cmd == "stack-prev" then
+    gh_review.prev_stack_commit()
   elseif cmd == "refresh" then
     gh_review.refresh()
   elseif cmd == "close" then
     gh_review.close()
   else
     vim.notify("GHReview: unknown command '" .. (cmd or "") .. "'", vim.log.levels.ERROR)
-    vim.notify("Usage: GHReview checkout|current|files|comments|hover|description|refresh|close", vim.log.levels.INFO)
+    vim.notify(
+      "Usage: GHReview checkout|current|files|comments|hover|description|pending|submit|review|"
+        .. "stack|stack-next|stack-prev|refresh|close",
+      vim.log.levels.INFO
+    )
   end
 end, {
   nargs = "*",
   complete = function(_, line)
-    local subcmds = { "checkout", "current", "files", "comments", "hover", "description", "refresh", "close" }
     local args = vim.split(line, "%s+")
+    if (args[2] == "submit" or args[2] == "review") and #args == 3 then
+      return vim.tbl_filter(function(s)
+        return s:find(args[3] or "", 1, true) == 1
+      end, { "comment", "approve", "request-changes" })
+    end
+    local subcmds = {
+      "checkout", "current", "files", "comments", "hover", "description",
+      "pending", "submit", "review", "stack", "stack-next", "stack-prev", "refresh", "close",
+    }
     if #args <= 2 then
       return vim.tbl_filter(function(s)
         return s:find(args[2] or "", 1, true) == 1

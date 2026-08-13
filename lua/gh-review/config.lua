@@ -19,6 +19,9 @@ local M = {}
 ---@field comments_focus string
 ---@field reply string
 ---@field new_thread string
+---@field new_thread_direct string
+---@field pending_review string
+---@field review_pr string
 ---@field toggle_resolve string
 ---@field refresh string
 ---@field close string
@@ -35,6 +38,9 @@ local M = {}
 ---@field prev_diff string
 ---@field next_file string
 ---@field prev_file string
+---@field next_stack string
+---@field prev_stack string
+---@field stack string
 ---@field diffview string
 ---@field unified string
 ---@field ignore_whitespace string
@@ -75,6 +81,9 @@ M.defaults = {
     comments_focus = "Y",
     reply = "r",
     new_thread = "n",
+    new_thread_direct = "N",
+    pending_review = "p",
+    review_pr = "a",
     toggle_resolve = "t",
     refresh = "R",
     close = "q",
@@ -91,6 +100,9 @@ M.defaults = {
     prev_diff = "[d",
     next_file = "<leader>gN",
     prev_file = "<leader>gP",
+    next_stack = "s",
+    prev_stack = "S",
+    stack = "k",
     diffview = "w",
     unified = "u",
     ignore_whitespace = "W",

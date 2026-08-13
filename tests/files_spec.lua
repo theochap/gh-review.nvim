@@ -183,4 +183,68 @@ describe("files", function()
       assert.is_true(items[2].last)
     end)
   end)
+
+  describe("display_order", function()
+    --- Paths of `files.display_order(file_list)`, for terser assertions.
+    ---@param file_list table[]
+    ---@return string[]
+    local function order(file_list)
+      local paths = {}
+      for _, f in ipairs(files.display_order(file_list)) do
+        table.insert(paths, f.path)
+      end
+      return paths
+    end
+
+    it("returns an empty list for no files", function()
+      assert.are.same({}, order({}))
+    end)
+
+    it("lists directories before files, matching the sidebar", function()
+      local file_list = {
+        { path = "README.md", status = "modified" },
+        { path = "lua/init.lua", status = "modified" },
+        { path = "lua/ui/files.lua", status = "added" },
+      }
+      assert.are.same({ "lua/ui/files.lua", "lua/init.lua", "README.md" }, order(file_list))
+    end)
+
+    it("is independent of the order files came in", function()
+      local file_list = {
+        { path = "src/b.lua", status = "modified" },
+        { path = "docs/a.md", status = "added" },
+        { path = "src/a.lua", status = "modified" },
+      }
+      assert.are.same({ "docs/a.md", "src/a.lua", "src/b.lua" }, order(file_list))
+    end)
+
+    it("walks collapsed directory chains", function()
+      local file_list = {
+        { path = "top.lua", status = "modified" },
+        { path = "a/b/c/y.lua", status = "added" },
+        { path = "a/b/c/x.lua", status = "added" },
+      }
+      assert.are.same({ "a/b/c/x.lua", "a/b/c/y.lua", "top.lua" }, order(file_list))
+    end)
+
+    it("returns the same file tables it was given", function()
+      local file = { path = "a.lua", status = "modified" }
+      local ordered = files.display_order({ file })
+      assert.are.equal(file, ordered[1])
+    end)
+
+    it("matches the file items the picker renders", function()
+      local file_list = {
+        { path = "z.lua", status = "modified" },
+        { path = "pkg/deep/nested/one.lua", status = "added" },
+        { path = "pkg/two.lua", status = "modified" },
+        { path = "a.lua", status = "deleted" },
+      }
+      local from_items = {}
+      for _, item in ipairs(files._build_items(file_list, "/tmp/repo")) do
+        if not item._is_dir then table.insert(from_items, item._file_data.path) end
+      end
+      assert.are.same(from_items, order(file_list))
+    end)
+  end)
 end)
