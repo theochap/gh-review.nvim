@@ -854,6 +854,253 @@ describe("gh", function()
       assert.are.equal("--json", cmd[4])
       assert.are.equal("--limit", cmd[6])
       assert.are.equal("50", cmd[7])
+      assert.is_nil(cmd[8])
+    end)
+
+    it("passes search qualifiers when given", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = "[]", stderr = "" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local done = false
+      gh.pr_list(function() done = true end, "author:@me")
+      vim.wait(100, function() return done end)
+
+      local cmd = captured[1].cmd
+      assert.are.equal("--search", cmd[8])
+      assert.are.equal("author:@me", cmd[9])
+    end)
+  end)
+
+  describe("pr_review_states", function()
+    it("asks for the decision and your own latest review, newest first", function()
+      gh = require("gh-review.gh")
+      gh.repo_name = function(cb) cb(nil, "o/r") end
+      local sent
+      gh.graphql = function(query, vars, cb)
+        sent = { query = query, q = vars.q }
+        cb(nil, { search = { nodes = {
+          { number = 1, reviewDecision = "APPROVED", viewerLatestReview = { state = "COMMENTED" } },
+          { number = 2, reviewDecision = vim.NIL, viewerLatestReview = vim.NIL },
+        } } })
+      end
+      local states
+      gh.pr_review_states(function(_, s) states = s end, "author:@me")
+      assert.are.equal("repo:o/r is:pr is:open sort:created-desc author:@me", sent.q)
+      assert.is_truthy(sent.query:find("viewerLatestReview { state }", 1, true))
+      assert.are.same({ [1] = { decision = "APPROVED", viewer = "COMMENTED" }, [2] = {} }, states)
+    end)
+
+    it("reports repo and query errors", function()
+      gh = require("gh-review.gh")
+      gh.repo_name = function(cb) cb("no repo", nil) end
+      local err
+      gh.pr_review_states(function(e) err = e end)
+      assert.are.equal("no repo", err)
+    end)
+  end)
+
+  describe("pr_stacks", function()
+    it("asks for the stack of each PR, newest first, and keys it by PR number", function()
+      gh = require("gh-review.gh")
+      gh.repo_name = function(cb) cb(nil, "o/r") end
+      local sent
+      gh.graphql = function(query, vars, cb)
+        sent = { query = query, q = vars.q }
+        cb(nil, { search = { nodes = {
+          { number = 1, stack = { number = 7, entries = { nodes = {} } } },
+          { number = 2, stack = vim.NIL },
+        } } })
+      end
+      local stacks
+      gh.pr_stacks(function(_, s) stacks = s end, "author:@me")
+      assert.are.equal("repo:o/r is:pr is:open sort:created-desc author:@me", sent.q)
+      assert.is_truthy(sent.query:find("author { login }", 1, true))
+      assert.are.same({ [1] = { number = 7, entries = { nodes = {} } } }, stacks)
+    end)
+  end)
+
+  describe("viewer_login", function()
+    it("asks GitHub once and remembers the login", function()
+      gh = require("gh-review.gh")
+      gh.forget_viewer_login()
+      local asked = 0
+      gh.graphql = function(_, _, cb)
+        asked = asked + 1
+        cb(nil, { viewer = { login = "me" } })
+      end
+      local logins = {}
+      gh.viewer_login(function(_, l) table.insert(logins, l) end)
+      gh.viewer_login(function(_, l) table.insert(logins, l) end)
+      assert.are.same({ "me", "me" }, logins)
+      assert.are.equal(1, asked)
+      gh.forget_viewer_login()
+    end)
+
+    it("reports a failed lookup", function()
+      gh = require("gh-review.gh")
+      gh.forget_viewer_login()
+      gh.graphql = function(_, _, cb) cb("bad credentials", nil) end
+      local err
+      gh.viewer_login(function(e) err = e end)
+      assert.are.equal("bad credentials", err)
+    end)
+  end)
+
+  describe("pr_merge_async", function()
+    it("PUTs merge-async with the API version, method and sha", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = vim.json.encode({ status = "pending", details = { uuid = "u1" } }), stderr = "" },
+      }, captured)
+      gh = require("gh-review.gh")
+
+      local result
+      gh.pr_merge_async("o/r", 12, { merge_method = "squash", sha = "abc" }, function(err, r)
+        assert.is_nil(err)
+        result = r
+      end)
+      vim.wait(100, function() return result ~= nil end)
+
+      local cmd = table.concat(captured[1].cmd, " ")
+      assert.is_truthy(cmd:find("api --method PUT -H X-GitHub-Api-Version: 2026-03-10", 1, true))
+      assert.is_truthy(cmd:find("repos/o/r/pulls/12/merge-async", 1, true))
+      assert.is_truthy(cmd:find("-f merge_method=squash", 1, true))
+      assert.is_truthy(cmd:find("-f sha=abc", 1, true))
+      assert.are.equal("u1", result.details.uuid)
+    end)
+
+    it("omits the method for merge queues", function()
+      orig_system = stub_vim_system({ { code = 0, stdout = "{}", stderr = "" } }, captured)
+      gh = require("gh-review.gh")
+      local done = false
+      gh.pr_merge_async("o/r", 12, {}, function() done = true end)
+      vim.wait(100, function() return done end)
+      local cmd = table.concat(captured[1].cmd, " ")
+      assert.is_nil(cmd:find("merge_method", 1, true))
+      assert.is_nil(cmd:find("sha=", 1, true))
+    end)
+
+    it("polls the merge status by uuid", function()
+      orig_system = stub_vim_system({
+        { code = 0, stdout = vim.json.encode({ status = "merged", details = {} }), stderr = "" },
+      }, captured)
+      gh = require("gh-review.gh")
+      local result
+      gh.pr_merge_async_status("o/r", 12, "u1", function(_, r) result = r end)
+      vim.wait(100, function() return result ~= nil end)
+      local cmd = table.concat(captured[1].cmd, " ")
+      assert.is_truthy(cmd:find("repos/o/r/pulls/12/merge-async/u1", 1, true))
+      assert.are.equal("merged", result.status)
+    end)
+  end)
+
+  describe("checkout with a hint", function()
+    local vcs, saved
+
+    before_each(function()
+      gh = require("gh-review.gh")
+      vcs = require("gh-review.vcs")
+      saved = {
+        context = vcs.context, jj_checkout = vcs.jj_checkout,
+        jj_has_commit = vcs.jj_has_commit, jj_new = vcs.jj_new,
+      }
+    end)
+
+    after_each(function()
+      for k, v in pairs(saved) do vcs[k] = v end
+    end)
+
+    it("jj workspace: uses the hinted branch and head, without gh pr view", function()
+      vcs.context = function() return { kind = "jj", jj_root = "/ws" } end
+      local args
+      vcs.jj_checkout = function(branch, cb, _, _, opts)
+        args = { branch = branch, head = opts.head_oid, on_fetch = opts.on_fetch }
+        cb(nil)
+      end
+      gh.run = function() error("gh should not be called") end
+      local err = "unset"
+      gh.checkout(5, function(e) err = e end, { head_oid = "abc", head_ref = "feat" })
+      assert.is_nil(err)
+      assert.are.equal("feat", args.branch)
+      assert.are.equal("abc", args.head)
+      local notes = {}
+      local orig = vim.notify
+      vim.notify = function(m) table.insert(notes, m) end
+      args.on_fetch()
+      vim.notify = orig
+      assert.are.same({ "GHReview: fetching feat..." }, notes)
+    end)
+
+    -- A colocated workspace (the main one, or a secondary one that jj made a
+    -- git worktree) checks out the jj way too; gh pr checkout is the fallback.
+    it("colocated jj: checks out with jj, without gh", function()
+      vcs.context = function() return { kind = "git", jj_root = "/repo" } end
+      local args
+      vcs.jj_checkout = function(branch, cb, _, _, opts)
+        args = { branch = branch, head = opts.head_oid }
+        cb(nil)
+      end
+      local gh_calls = {}
+      gh._gh_pr_checkout = function(n, cb) table.insert(gh_calls, n); cb(nil) end
+      local err = "unset"
+      gh.checkout(5, function(e) err = e end, { head_oid = "abc", head_ref = "feat" })
+      assert.is_nil(err)
+      assert.are.same({ branch = "feat", head = "abc" }, args)
+      assert.are.same({}, gh_calls)
+    end)
+
+    it("colocated jj: falls back to gh pr checkout when jj fails", function()
+      vcs.context = function() return { kind = "git", jj_root = "/repo" } end
+      vcs.jj_checkout = function(_, cb) cb("no such branch on origin") end
+      local gh_calls = {}
+      gh._gh_pr_checkout = function(n, cb) table.insert(gh_calls, n); cb(nil) end
+      local notes = {}
+      local orig = vim.notify
+      vim.notify = function(m) table.insert(notes, m) end
+      local err = "unset"
+      gh.checkout(5, function(e) err = e end, { head_ref = "feat" })
+      vim.notify = orig
+      assert.is_nil(err)
+      assert.are.same({ 5 }, gh_calls)
+      assert.is_truthy(notes[1]:find("no such branch on origin", 1, true))
+    end)
+  end)
+
+  describe("checkout_stack", function()
+    local vcs, orig_jj_root, orig_jj_checkout
+
+    before_each(function()
+      gh = require("gh-review.gh")
+      vcs = require("gh-review.vcs")
+      orig_jj_root = vcs.jj_root
+      orig_jj_checkout = vcs.jj_checkout
+    end)
+
+    after_each(function()
+      vcs.jj_root = orig_jj_root
+      vcs.jj_checkout = orig_jj_checkout
+    end)
+
+    it("fetches every branch and goes on top of the last one under jj", function()
+      vcs.jj_root = function() return "/repo" end
+      local args
+      vcs.jj_checkout = function(branch, cb, cwd, fetch, opts)
+        args = { branch = branch, cwd = cwd, fetch = fetch, head = opts.head_oid }
+        cb(nil)
+      end
+      local err = "unset"
+      gh.checkout_stack(3, { "b1", "b2", "b3" }, function(e) err = e end, "h3")
+      assert.is_nil(err)
+      assert.are.same({ branch = "b3", fetch = { "b1", "b2", "b3" }, head = "h3" }, args)
+    end)
+
+    it("checks out the top PR under git", function()
+      vcs.jj_root = function() return nil end
+      local checked
+      gh.checkout = function(n, cb) checked = n; cb(nil) end
+      gh.checkout_stack(3, { "b1", "b3" }, function() end)
+      assert.are.equal(3, checked)
     end)
   end)
 
@@ -873,6 +1120,37 @@ describe("gh", function()
       vim.wait(100, function() return done end)
 
       assert.are.equal("owner/repo", result_repo)
+    end)
+
+    it("remembers the name and shares one lookup between concurrent calls", function()
+      local pending_cb
+      local calls = 0
+      gh = require("gh-review.gh")
+      gh.run = function(_, cb) calls = calls + 1; pending_cb = cb end
+      local got = {}
+      gh.repo_name(function(_, r) table.insert(got, r) end)
+      gh.repo_name(function(_, r) table.insert(got, r) end)
+      assert.are.equal(1, calls)
+      pending_cb(nil, "o/r\n")
+      assert.are.same({ "o/r", "o/r" }, got)
+      -- Remembered: answered at once, no new process.
+      gh.repo_name(function(_, r) table.insert(got, r) end)
+      assert.are.equal(1, calls)
+      assert.are.equal(3, #got)
+      gh.forget_repo_names()
+      gh.repo_name(function() end)
+      assert.are.equal(2, calls)
+    end)
+
+    it("does not remember failures", function()
+      local calls = 0
+      gh = require("gh-review.gh")
+      gh.run = function(_, cb) calls = calls + 1; cb("no remote", nil) end
+      local errs = {}
+      gh.repo_name(function(e) table.insert(errs, e) end)
+      gh.repo_name(function(e) table.insert(errs, e) end)
+      assert.are.same({ "no remote", "no remote" }, errs)
+      assert.are.equal(2, calls)
     end)
 
     it("passes error through on failure", function()

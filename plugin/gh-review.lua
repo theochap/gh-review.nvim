@@ -34,6 +34,28 @@ vim.api.nvim_create_user_command("GHReview", function(opts)
     gh_review.next_stack_commit()
   elseif cmd == "stack-prev" then
     gh_review.prev_stack_commit()
+  elseif cmd == "prs" or cmd == "stacks" then
+    local scope, err = require("gh-review.scope").parse(#args > 1 and { unpack(args, 2) } or nil)
+    if not scope then
+      vim.notify("GHReview: " .. err, vim.log.levels.ERROR)
+    elseif cmd == "prs" then
+      gh_review.pr_list(scope)
+    else
+      gh_review.gh_stacks(scope)
+    end
+  elseif cmd == "gh-stack" then
+    gh_review.gh_stack_panel(tonumber(args[2]))
+  elseif cmd == "suggest" or cmd == "suggest-direct" then
+    local fn = cmd == "suggest" and gh_review.suggest_change or gh_review.suggest_change_direct
+    if opts.range > 0 then
+      fn(opts.line1, opts.line2)
+    else
+      fn()
+    end
+  elseif cmd == "local" then
+    gh_review.toggle_local_diff()
+  elseif cmd == "cache-clear" then
+    gh_review.clear_cache()
   elseif cmd == "refresh" then
     gh_review.refresh()
   elseif cmd == "close" then
@@ -42,12 +64,13 @@ vim.api.nvim_create_user_command("GHReview", function(opts)
     vim.notify("GHReview: unknown command '" .. (cmd or "") .. "'", vim.log.levels.ERROR)
     vim.notify(
       "Usage: GHReview checkout|current|files|comments|hover|description|pending|submit|review|"
-        .. "stack|stack-next|stack-prev|refresh|close",
+        .. "suggest|suggest-direct|stack|stack-next|stack-prev|prs|stacks|gh-stack|local|cache-clear|refresh|close",
       vim.log.levels.INFO
     )
   end
 end, {
   nargs = "*",
+  range = true,
   complete = function(_, line)
     local args = vim.split(line, "%s+")
     if (args[2] == "submit" or args[2] == "review") and #args == 3 then
@@ -55,9 +78,23 @@ end, {
         return s:find(args[3] or "", 1, true) == 1
       end, { "comment", "approve", "request-changes" })
     end
+    if (args[2] == "prs" or args[2] == "stacks") and #args >= 3 then
+      local scope_mod = require("gh-review.scope")
+      local candidates = {}
+      if #args == 3 then vim.list_extend(candidates, scope_mod.KINDS) end
+      for _, def in ipairs(scope_mod.FILTERS) do
+        for _, choice in ipairs(def.choices or {}) do table.insert(candidates, choice[2]) end
+        if def.kind ~= "custom" and def.qualifier then
+          table.insert(candidates, (def.qualifier("x"):gsub("x$", "")))
+        end
+      end
+      local typed = args[#args] or ""
+      return vim.tbl_filter(function(s) return s:find(typed, 1, true) == 1 end, candidates)
+    end
     local subcmds = {
       "checkout", "current", "files", "comments", "hover", "description",
-      "pending", "submit", "review", "stack", "stack-next", "stack-prev", "refresh", "close",
+      "pending", "submit", "review", "suggest", "suggest-direct", "stack", "stack-next", "stack-prev",
+      "prs", "stacks", "gh-stack", "local", "cache-clear", "refresh", "close",
     }
     if #args <= 2 then
       return vim.tbl_filter(function(s)

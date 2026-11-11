@@ -78,11 +78,17 @@ function M.open(file_path, target_line)
 		local oid = active_commit.oid
 		local short_sha = oid:sub(1, 8)
 
-		-- Right side: commit version of the file
-		local right_lines = util.git_show_lines(oid .. ":" .. file_path, cwd)
-		local work_buf = util.create_scratch_buf("ghreview://commit/" .. short_sha .. "/" .. file_path, right_lines, file_path)
-		vim.api.nvim_win_set_buf(0, work_buf)
-		current.work_buf = work_buf
+		-- Right side: the commit version of the file. When the working copy sits
+		-- on the commit, that is the file on disk, which stays editable.
+		if state.is_commit_on_disk() then
+			vim.cmd("edit " .. vim.fn.fnameescape(cwd .. "/" .. file_path))
+			current.work_buf = vim.api.nvim_get_current_buf()
+		else
+			local right_lines = util.git_show_lines(oid .. ":" .. file_path, cwd)
+			local work_buf = util.create_scratch_buf("ghreview://commit/" .. short_sha .. "/" .. file_path, right_lines, file_path)
+			vim.api.nvim_win_set_buf(0, work_buf)
+			current.work_buf = work_buf
+		end
 		current.work_win = vim.api.nvim_get_current_win()
 
 		-- Left side: parent commit version of the file

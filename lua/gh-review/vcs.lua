@@ -7,10 +7,13 @@
 ---   * jj leaves git HEAD detached, so `gh pr view` (no argument) fails with
 ---     "not on any branch" and PR auto-detection never fires. The branch a PR
 ---     was opened from lives in a jj *bookmark* instead.
----   * A secondary jj workspace (`jj workspace add`) contains only a `.jj/`
----     directory — no `.git` at all — so plain `git`/`gh` invocations fail with
----     "not a git repository". The backing git repo is reachable through
----     `.jj/repo` → `store/git_target`.
+---   * In a colocated repo, jj ≥ 0.34 makes every secondary workspace
+---     (`jj workspace add`) a git worktree too: a `.git` file next to `.jj/`
+---     points into `<main>/.git/worktrees/<name>`, so `git` and `gh` work there
+---     as usual. Older jj, and non-colocated repos, give the workspace only a
+---     `.jj/` directory — no `.git` at all — so plain `git`/`gh` invocations
+---     fail with "not a git repository". The backing git repo is then reachable
+---     through `.jj/repo` → `store/git_target`.
 ---   * A non-colocated jj repo keeps its git store as a bare repo under
 ---     `.jj/repo/store/git`, which `gh` cannot discover from the cwd.
 ---
@@ -97,6 +100,17 @@ local function resolve_dot_git(root)
   local target = (read_file(path) or ""):match("^gitdir:%s*(.-)%s*$")
   if not target then return nil end
   return join(root, target)
+end
+
+--- The git directory shared by every worktree of a repository. A linked
+--- worktree's own git directory holds a `commondir` file pointing back to it;
+--- the remotes live in the config there.
+---@param dot_git string
+---@return string
+local function common_dir(dot_git)
+  local pointer = read_file(dot_git .. "/commondir")
+  if not pointer or vim.trim(pointer) == "" then return dot_git end
+  return join(dot_git, vim.trim(pointer))
 end
 
 --- Resolve the git directory backing a jj repository.
@@ -191,15 +205,22 @@ local function detect(cwd)
   end
 
   if has_git then
-    -- Plain git worktree, or a colocated jj repo: `git` and `gh` both work from
-    -- the cwd as-is. Only branch detection needs jj help (HEAD is detached),
-    -- which `pr_branch_candidates` handles via `jj_root`.
-    return {
+    -- Plain git worktree, or a colocated jj workspace (the main one, or a
+    -- secondary one that is also a git worktree): `git` and `gh` both work
+    -- from the cwd as-is. Only branch detection needs jj help (HEAD is
+    -- detached), which `pr_branch_candidates` handles via `jj_root`.
+    ---@type GHReviewVcsContext
+    local ctx = {
       kind = "git",
       root = dir,
       jj_root = has_jj and dir or nil,
       dot_git = resolve_dot_git(dir),
     }
+    -- jj fetches name the remote explicitly (see `jj_checkout`).
+    if ctx.jj_root and ctx.dot_git then
+      ctx.remote = remote_from_config(common_dir(ctx.dot_git))
+    end
+    return ctx
   end
 
   ---@type GHReviewVcsContext
@@ -438,17 +459,19 @@ local function parse_jj_commits(out)
 end
 
 --- Run a `jj` command asynchronously in the workspace containing `cwd`.
---- Like `jj_read`, the working copy is left unsnapshotted.
+--- Like `jj_read`, the working copy is left unsnapshotted, unless `snapshot`
+--- asks for the edits on disk to be recorded into `@` first.
 ---@param args string[] Arguments after `jj`
 ---@param callback fun(err: string?, out: string?)
 ---@param cwd? string
-local function jj_run_async(args, callback, cwd)
+---@param snapshot? boolean
+local function jj_run_async(args, callback, cwd, snapshot)
   local ctx = M.context(cwd)
   if not ctx.jj_root then
     callback("not inside a jj workspace")
     return
   end
-  local cmd = vim.list_extend({ "jj", "--ignore-working-copy" }, args)
+  local cmd = vim.list_extend(snapshot and { "jj" } or { "jj", "--ignore-working-copy" }, args)
   vim.system(cmd, { text = true, cwd = ctx.jj_root }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
@@ -519,15 +542,22 @@ function M.jj_change_ids(revs, callback, cwd)
   end, cwd)
 end
 
+--- Empty working-copy commits, of this workspace or any other: what `jj new`
+--- leaves on top of the commit you are on. They are not part of a stack, and
+--- listing them would show a commit under review as forked, or a tip as having
+--- a descendant.
+M.EMPTY_WORKING_COPIES = "(working_copies() & empty())"
+
 --- Commits immediately adjacent to `rev` in the jj graph: its children when
 --- walking a stack upwards, its parents when walking down. Usually one of each,
---- but a stack can fork, so all of them are returned.
+--- but a stack can fork, so all of them are returned. Empty working copies are
+--- left out (see `EMPTY_WORKING_COPIES`).
 ---@param rev string Revision to move from ("@", a commit id, a bookmark)
 ---@param direction "children"|"parents"
 ---@param callback fun(err: string?, commits: GHReviewJJCommit[]?)
 ---@param cwd? string
 function M.jj_adjacent(rev, direction, callback, cwd)
-  local revset = direction .. "(" .. rev .. ")"
+  local revset = direction .. "(" .. rev .. ") ~ " .. M.EMPTY_WORKING_COPIES
   jj_run_async({ "log", "-r", revset, "--no-graph", "-T", COMMIT_TEMPLATE }, function(err, out)
     if err then
       callback(err, nil)
@@ -597,8 +627,12 @@ function M.jj_stack(anchor, callback, cwd)
   end
   -- `& ::visible_heads()` drops commits that have been rewritten locally: they
   -- are still resolvable by id but are no longer part of any branch, so listing
-  -- them would show a stale duplicate of a commit already in the stack.
-  local revset = ("(trunk()..heads(%s)) & ::visible_heads()"):format(table.concat(terms, " | "))
+  -- them would show a stale duplicate of a commit already in the stack. Empty
+  -- working copies are not part of the stack either.
+  local revset = ("(trunk()..heads(%s)) & ::visible_heads() ~ %s"):format(
+    table.concat(terms, " | "),
+    M.EMPTY_WORKING_COPIES
+  )
   local args = {
     "log", "-r", revset, "--no-graph", "-n", tostring(M.STACK_LIMIT), "-T", COMMIT_TEMPLATE,
   }
@@ -638,11 +672,142 @@ function M.jj_downstream_bookmarks(rev, callback, cwd)
   end, cwd)
 end
 
+--- Put the working copy on `rev` with `jj new`, so the files on disk are the
+--- commit's. Nothing runs when `@` already is `rev` or an empty change on top
+--- of it. `jj new` keeps any edits in the old `@`, and jj abandons that change
+--- when it is empty, so moving around does not pile up empty commits.
+---@param rev string Commit id
+---@param callback fun(err: string?, moved: boolean?)
+---@param cwd? string
+function M.jj_move_to(rev, callback, cwd)
+  -- Already there: `@` is `rev`, or `@` is empty and its parent is `rev`.
+  local revset = ("present(%s) & (@ | parents(@ & empty()))"):format(rev)
+  jj_run_async({ "log", "-r", revset, "--no-graph", "-T", 'commit_id ++ "\\n"' }, function(err, out)
+    if err then
+      callback(err)
+      return
+    end
+    if vim.trim(out or "") ~= "" then
+      callback(nil, false)
+      return
+    end
+    M.jj_new(rev, function(new_err) callback(new_err, not new_err) end, cwd)
+  end, cwd)
+end
+
+---@class GHReviewLocalPRSpec
+---@field head_ref? string PR head branch
+---@field head_oid? string PR head commit as pushed
+---@field base_ref? string PR base branch
+---@field base_oid? string PR base commit as pushed
+
+--- Revset of the local tip of a PR: the head bookmark (jj moves it along when
+--- the commit is rewritten), else the pushed head. When `@` descends from it,
+--- the commits in between are unpushed work on the PR and count too, up to
+--- the last non-empty one — unless one of them carries a bookmark: then `@`
+--- sits on a PR stacked above, and those commits are not this PR's.
+---@param spec GHReviewLocalPRSpec
+---@return string? revset nil when there is nothing to locate the PR by
+function M.local_pr_head_revset(spec)
+  local tips = {}
+  if spec.head_ref and spec.head_ref ~= "" then
+    table.insert(tips, ("bookmarks(exact:%s)"):format(revset_string(spec.head_ref)))
+  end
+  if spec.head_oid and spec.head_oid:match("^%x+$") then
+    table.insert(tips, ("present(%s)"):format(spec.head_oid))
+  end
+  if #tips == 0 then return nil end
+  local tip = "coalesce(" .. table.concat(tips, ", ") .. ")"
+  local above = ("(%s::@ ~ %s)"):format(tip, tip)
+  local marked = ("(%s & (bookmarks() | remote_bookmarks()))"):format(above)
+  -- In a line of commits every one is at or below a bookmark, or at or above
+  -- it, so this is empty as soon as any of them is bookmarked.
+  local unpushed = ("(%s ~ ::%s ~ %s::)"):format(above, marked, marked)
+  return ("coalesce(heads((%s | %s) ~ empty()), %s)"):format(tip, unpushed, tip)
+end
+
+--- Revset of the local base of a PR: the base branch, local and remote, and
+--- the pushed base. The merge base with the head is taken against all of them,
+--- so a stale one (a local `main` behind the remote, a remote base branch
+--- rewritten locally) does not pull in extra commits.
+---@param spec GHReviewLocalPRSpec
+---@return string? revset nil when there is nothing to locate the base by
+function M.local_pr_base_revset(spec)
+  local terms = {}
+  if spec.base_ref and spec.base_ref ~= "" then
+    local quoted = revset_string(spec.base_ref)
+    table.insert(terms, ("bookmarks(exact:%s)"):format(quoted))
+    table.insert(terms, ("remote_bookmarks(exact:%s)"):format(quoted))
+  end
+  if spec.base_oid and spec.base_oid:match("^%x+$") then
+    table.insert(terms, ("present(%s)"):format(spec.base_oid))
+  end
+  if #terms == 0 then return nil end
+  return table.concat(terms, " | ")
+end
+
+--- Locate the local version of a PR: its tip (see `local_pr_head_revset`) and
+--- the merge base of that tip with the PR base. The working copy is
+--- snapshotted first, so edits not yet recorded by jj are part of the tip.
+---@param spec GHReviewLocalPRSpec
+---@param callback fun(err: string?, range: { head: string, base: string }?)
+---@param cwd? string
+function M.jj_local_pr(spec, callback, cwd)
+  local head_revset = M.local_pr_head_revset(spec)
+  local base_revset = M.local_pr_base_revset(spec)
+  if not head_revset or not base_revset then
+    callback("the PR head or base branch is unknown")
+    return
+  end
+  local template = 'commit_id ++ "\\n"'
+  jj_run_async({ "log", "-r", head_revset, "--no-graph", "-n", "1", "-T", template }, function(err, out)
+    if err then
+      callback(err)
+      return
+    end
+    local head = vim.trim(out or ""):match("^%x+")
+    if not head then
+      callback("the PR head is not in this jj repository (fetch it first?)")
+      return
+    end
+    local mb = ("heads(::%s & ::(%s))"):format(head, base_revset)
+    jj_run_async({ "log", "-r", mb, "--no-graph", "-n", "1", "-T", template }, function(mb_err, mb_out)
+      if mb_err then
+        callback(mb_err)
+        return
+      end
+      local base = vim.trim(mb_out or ""):match("^%x+")
+      if not base then
+        callback("the PR base " .. (spec.base_ref or "") .. " is not in this jj repository")
+        return
+      end
+      callback(nil, { head = head, base = base })
+    end, cwd)
+  end, cwd, true)
+end
+
 --- Revision holding the current work, for diffing against the PR base.
 --- "HEAD" everywhere git can answer; in a jj workspace HEAD belongs to another
 --- workspace's checkout, so the working-copy commit is used instead.
 ---@param cwd? string
 ---@return string? rev nil when nothing can be resolved
+--- Commit id the working copy is based on: `HEAD` under git (also in a
+--- colocated jj repo, where git HEAD sits on `@-`), `@-` in a jj workspace.
+--- Unlike `@`, it does not change when jj snapshots an edit. Nil on failure.
+---@param cwd? string
+---@return string?
+function M.base_commit(cwd)
+  local ctx = M.context(cwd)
+  if ctx.kind == "jj" then
+    local out = jj_read(ctx.jj_root, { "log", "-r", "@-", "--no-graph", "-T", 'commit_id ++ "\\n"' })
+    return out and vim.split(out, "\n")[1] or nil
+  end
+  if ctx.kind == "none" then return nil end
+  local result = vim.system(M.git_cmd({ "rev-parse", "HEAD" }, cwd), { text = true, cwd = cwd }):wait()
+  if result.code ~= 0 then return nil end
+  return vim.trim(result.stdout or "")
+end
+
 function M.head_rev(cwd)
   local ctx = M.context(cwd)
   if ctx.kind ~= "jj" then
@@ -658,7 +823,10 @@ end
 ---@param branch string PR head branch name
 ---@param callback fun(err: string?)
 ---@param cwd? string
-function M.jj_checkout(branch, callback, cwd)
+---@param fetch_branches? string[] Branches to fetch (default: just `branch`), e.g. a whole stack
+---@param opts? { head_oid?: string, on_fetch?: fun() } `head_oid`: the PR head; when jj already has it, the fetch is skipped. `on_fetch` runs before a fetch starts.
+function M.jj_checkout(branch, callback, cwd, fetch_branches, opts)
+  opts = opts or {}
   local ctx = M.context(cwd)
   if not ctx.jj_root then
     callback("not inside a jj workspace")
@@ -666,30 +834,73 @@ function M.jj_checkout(branch, callback, cwd)
   end
   local remote = ctx.remote or "origin"
 
-  local function fail(result, what)
-    local msg = result.stderr and vim.trim(result.stderr) or ""
-    if msg == "" then msg = what .. " exited with code " .. result.code end
-    vim.schedule(function() callback(msg) end)
-  end
-
-  vim.system({ "jj", "git", "fetch", "--remote", remote, "-b", branch }, {
-    text = true,
-    cwd = ctx.jj_root,
-  }, function(fetch)
-    if fetch.code ~= 0 then
-      fail(fetch, "jj git fetch")
-      return
+  local function fetch_then_new()
+    if opts.on_fetch then opts.on_fetch() end
+    local fetch_cmd = { "jj", "git", "fetch", "--remote", remote }
+    for _, b in ipairs(fetch_branches or { branch }) do
+      vim.list_extend(fetch_cmd, { "-b", b })
     end
-    vim.system({ "jj", "new", branch .. "@" .. remote }, {
+    vim.system(fetch_cmd, {
       text = true,
       cwd = ctx.jj_root,
-    }, function(new)
-      if new.code ~= 0 then
-        fail(new, "jj new")
+    }, function(fetch)
+      if fetch.code ~= 0 then
+        local msg = fetch.stderr and vim.trim(fetch.stderr) or ""
+        if msg == "" then msg = "jj git fetch exited with code " .. fetch.code end
+        vim.schedule(function() callback(msg) end)
         return
       end
-      vim.schedule(function() callback(nil) end)
+      M.jj_new(branch .. "@" .. remote, callback, cwd)
     end)
+  end
+
+  -- A fetch walks every ref of the store, which takes minutes in a large repo.
+  -- When jj already has the PR head (fetched earlier, or pushed from here),
+  -- put the working copy on it directly.
+  if not opts.head_oid then
+    fetch_then_new()
+    return
+  end
+  M.jj_has_commit(opts.head_oid, function(has)
+    if has then
+      M.jj_new(opts.head_oid, callback, cwd)
+    else
+      fetch_then_new()
+    end
+  end, cwd)
+end
+
+--- Whether jj knows commit `oid`, without touching the network.
+---@param oid string
+---@param callback fun(has: boolean)
+---@param cwd? string
+function M.jj_has_commit(oid, callback, cwd)
+  local ctx = M.context(cwd)
+  if not ctx.jj_root or not oid or not oid:match("^%x+$") then
+    callback(false)
+    return
+  end
+  vim.system({
+    "jj", "--ignore-working-copy", "log", "-r", "present(" .. oid .. ")", "--no-graph", "-T", "commit_id",
+  }, { text = true, cwd = ctx.jj_root }, function(result)
+    local has = result.code == 0 and vim.trim(result.stdout or "") ~= ""
+    vim.schedule(function() callback(has) end)
+  end)
+end
+
+--- Move the working copy to a new empty change on top of `rev`.
+---@param rev string
+---@param callback fun(err: string?)
+---@param cwd? string
+function M.jj_new(rev, callback, cwd)
+  local ctx = M.context(cwd)
+  vim.system({ "jj", "new", rev }, { text = true, cwd = ctx.jj_root }, function(result)
+    local err
+    if result.code ~= 0 then
+      err = result.stderr and vim.trim(result.stderr) or ""
+      if err == "" then err = "jj new exited with code " .. result.code end
+    end
+    vim.schedule(function() callback(err) end)
   end)
 end
 

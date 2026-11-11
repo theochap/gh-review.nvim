@@ -77,6 +77,7 @@ end
 describe("init", function()
   local gh, graphql, diagnostics, init, util
   local orig_git_merge_base
+  local pr_content, orig_compute_local
 
   before_each(function()
     config.setup()
@@ -86,6 +87,11 @@ describe("init", function()
     util = require("gh-review.util")
     orig_git_merge_base = util.git_merge_base
     util.git_merge_base = function() return "merge_base_sha" end
+
+    -- No real git in these tests: local PR content is covered by pr_content_spec.
+    pr_content = require("gh-review.pr_content")
+    orig_compute_local = pr_content.compute_local
+    pr_content.compute_local = function(_, cb) cb(nil) end
 
     -- Stub diagnostics before requiring init
     package.loaded["gh-review.ui.diagnostics"] = {
@@ -118,6 +124,8 @@ describe("init", function()
       focus = function() end,
       show = function() end,
       sync_selection = function() end,
+      sync_current = function() end,
+      is_open = function() return false end,
       display_order = real_files.display_order,
     }
 
@@ -150,6 +158,7 @@ describe("init", function()
   after_each(function()
     state.clear()
     util.git_merge_base = orig_git_merge_base
+    pr_content.compute_local = orig_compute_local
     -- Clean up stubs
     package.loaded["gh-review.ui.diagnostics"] = nil
     package.loaded["gh-review.integrations.which_key"] = nil
@@ -160,6 +169,14 @@ describe("init", function()
   end)
 
   describe("_load_pr_data", function()
+    -- Threads and the PR id no longer wait for the metadata, so every test
+    -- needs them stubbed (or they would reach the real gh).
+    before_each(function()
+      gh.repo_name = function(cb) cb(nil, "org/repo") end
+      graphql.fetch_threads = function(_, _, _, cb) cb(nil, {}) end
+      graphql.fetch_pr_id = function(_, _, _, cb) cb(nil, "PR_id") end
+    end)
+
     --- Stub all 5 async data sources for a happy-path load
     local function stub_happy_path()
       gh.pr_view = function(_, cb)
@@ -257,6 +274,79 @@ describe("init", function()
       assert.is_true(refresh_called)
     end)
 
+    it("starts the content load at once when the commits are known", function()
+      local order = {}
+      gh.repo_name = function(cb) cb(nil, "org/repo") end
+      gh.pr_view = function(_, cb)
+        table.insert(order, "pr_view")
+        cb(nil, make_pr({ headRefOid = "h", baseRefOid = "b" }))
+      end
+      graphql.fetch_pr_id = function(_, _, _, cb) cb(nil, "id") end
+      graphql.fetch_threads = function(_, _, _, cb) cb(nil, {}) end
+      gh.pr_comments = function(_, cb) cb(nil, {}) end
+      local refs = {}
+      pr_content.compute_local = function(ref, cb)
+        table.insert(order, "content")
+        table.insert(refs, ref)
+        cb({ files = { { path = "a", status = "modified", additions = 1, deletions = 0 } }, diff_text = "", commits = {}, source = "local" })
+      end
+      local done = false
+      init._load_pr_data(42, function() done = true end, { head_oid = "h", base_oid = "b" })
+      assert.is_true(done)
+      assert.are.same({ "content", "pr_view" }, order)
+      assert.are.same({ repo = "org/repo", number = 42, head_oid = "h", base_oid = "b" }, refs[1])
+      assert.are.equal("local", state.get_content_source())
+      assert.are.equal(1, #state.get_files())
+    end)
+
+    it("loads content after the metadata names the commits", function()
+      gh.repo_name = function(cb) cb(nil, "org/repo") end
+      gh.pr_view = function(_, cb) cb(nil, make_pr({ headRefOid = "h2", baseRefOid = "b2" })) end
+      graphql.fetch_pr_id = function(_, _, _, cb) cb(nil, "id") end
+      graphql.fetch_threads = function(_, _, _, cb) cb(nil, {}) end
+      gh.pr_comments = function(_, cb) cb(nil, {}) end
+      local ref
+      pr_content.compute_local = function(r, cb)
+        ref = r
+        cb({ files = {}, diff_text = "", commits = {}, source = "local" })
+      end
+      local done = false
+      init._load_pr_data(42, function() done = true end)
+      assert.is_true(done)
+      assert.are.equal("h2", ref.head_oid)
+      assert.are.equal("b2", ref.base_oid)
+    end)
+
+    it("skips pr_view when the caller passes the metadata", function()
+      local viewed = false
+      gh.pr_view = function() viewed = true end
+      gh.pr_comments = function(_, cb) cb(nil, {}) end
+      pr_content.compute_local = function(_, cb) cb({ files = {}, diff_text = "", commits = {}, source = "local" }) end
+      local done = false
+      init._load_pr_data(42, function() done = true end, nil, make_pr({ headRefOid = "h", baseRefOid = "b" }))
+      assert.is_true(done)
+      assert.is_false(viewed)
+      assert.are.equal(42, state.get_pr().number)
+      assert.are.equal("PR_id", state.get_pr().node_id)
+    end)
+
+    it("starts threads before the metadata returns, and keeps an early PR id", function()
+      local view_cb
+      gh.pr_view = function(_, cb) view_cb = cb end
+      local threads_started = false
+      graphql.fetch_threads = function(_, _, _, cb) threads_started = true; cb(nil, {}) end
+      gh.pr_comments = function(_, cb) cb(nil, {}) end
+      pr_content.compute_local = function(_, cb) cb({ files = {}, diff_text = "", commits = {}, source = "local" }) end
+      local done = false
+      init._load_pr_data(42, function() done = true end)
+      assert.is_true(threads_started)
+      assert.is_false(done)
+      view_cb(nil, make_pr({ headRefOid = "h", baseRefOid = "b" }))
+      assert.is_true(done)
+      -- The id arrived before set_pr and still made it onto the PR.
+      assert.are.equal("PR_id", state.get_pr().node_id)
+    end)
+
     it("collects errors from individual operations", function()
       -- All operations fail
       gh.pr_view = function(_, cb) cb("metadata error", nil) end
@@ -287,10 +377,9 @@ describe("init", function()
         if n.msg:find("errors loading PR data") then
           found_error = true
           assert.is_truthy(n.msg:find("metadata"))
-          assert.is_truthy(n.msg:find("files"))
-          assert.is_truthy(n.msg:find("diff"))
           assert.is_truthy(n.msg:find("comments"))
-          assert.is_truthy(n.msg:find("commits"))
+          -- Without metadata the commits are unknown, so content never loads.
+          assert.is_nil(n.msg:find("files"))
         end
       end
       assert.is_true(found_error)
@@ -582,6 +671,81 @@ describe("init", function()
     end)
   end)
 
+  describe("_load_pr_data with the local diff on", function()
+    local vcs = require("gh-review.vcs")
+    local orig_jj_root, orig_load_jj, orig_load
+
+    before_each(function()
+      orig_jj_root = vcs.jj_root
+      orig_load_jj = pr_content.load_jj
+      orig_load = pr_content.load
+      vcs.jj_root = function() return "/tmp/ws" end
+      gh.repo_name = function(cb) cb(nil, "org/repo") end
+      gh.pr_view = function(_, cb) cb(nil, make_pr({ headRefOid = "h1", baseRefOid = "b1" })) end
+      gh.pr_comments = function(_, cb) cb(nil, {}) end
+      graphql.fetch_threads = function(_, _, _, cb) cb(nil, {}) end
+      graphql.fetch_pr_id = function(_, _, _, cb) cb(nil, "PR_id") end
+      state.set_local_diff(true)
+    end)
+
+    after_each(function()
+      vcs.jj_root = orig_jj_root
+      pr_content.load_jj = orig_load_jj
+      pr_content.load = orig_load
+    end)
+
+    it("loads the local jj version, waiting for the branch names", function()
+      local asked
+      pr_content.load_jj = function(spec, cb)
+        asked = spec
+        cb(nil, {
+          files = { { path = "wip.lua", status = "added", additions = 1, deletions = 0 } },
+          diff_text = "",
+          commits = {},
+          source = "jj",
+          base_sha = "local_mb",
+        })
+      end
+      pr_content.load = function() error("GitHub content should not load") end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      local completed = false
+      -- The hint has both oids, but the local diff also needs the branches.
+      init._load_pr_data(42, function() completed = true end, { head_oid = "h1", base_oid = "b1" })
+      vim.wait(200, function() return completed end)
+
+      vim.notify = orig_notify
+      assert.is_true(completed)
+      assert.are.same({ head_ref = "feature-branch", head_oid = "h1", base_ref = "main", base_oid = "b1" }, asked)
+      assert.are.equal("wip.lua", state.get_files()[1].path)
+      assert.are.equal("jj", state.get_content_source())
+      assert.are.equal("local_mb", state.get_pr().base_sha)
+    end)
+
+    it("falls back to GitHub's diff, and turns the mode off, when there is no local version", function()
+      pr_content.load_jj = function(_, cb) cb("the PR head is not in this jj repository") end
+      local loaded_remote = false
+      pr_content.load = function(_, cb)
+        loaded_remote = true
+        cb(nil, { files = {}, diff_text = "", commits = {}, source = "network" })
+      end
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      local completed = false
+      init._load_pr_data(42, function() completed = true end)
+      vim.wait(200, function() return completed end)
+
+      vim.notify = orig_notify
+      assert.is_true(loaded_remote)
+      assert.is_false(state.get_local_diff())
+      assert.are.equal("merge_base_sha", state.get_pr().base_sha)
+      assert.is_truthy(table.concat(notifications, "\n"):find("not in this jj repository", 1, true))
+    end)
+  end)
+
   describe("_current_rel_path", function()
     it("returns nil and falls back to diff_review for empty buffer name", function()
       -- Create a scratch buffer with no name
@@ -646,6 +810,7 @@ describe("init", function()
   describe("select_commit", function()
     local orig_system
     local captured_cmds
+    local orig_base_commit, working_copy_parent
 
     before_each(function()
       -- Set up state as if a PR is active
@@ -661,6 +826,11 @@ describe("init", function()
         repository = "org/repo",
       })
       captured_cmds = {}
+      -- Where the working copy sits is a separate question (see below).
+      local vcs = require("gh-review.vcs")
+      orig_base_commit = vcs.base_commit
+      vcs.base_commit = function() return working_copy_parent end
+      working_copy_parent = nil
     end)
 
     after_each(function()
@@ -668,6 +838,24 @@ describe("init", function()
         vim.system = orig_system
         orig_system = nil
       end
+      require("gh-review.vcs").base_commit = orig_base_commit
+    end)
+
+    it("edits the files on disk when the working copy sits on the commit", function()
+      orig_system = vim.system
+      vim.system = function() return { wait = function() return { code = 0, stdout = "", stderr = "" } end } end
+      init._refresh_views = function() end
+
+      working_copy_parent = "abc1234full"
+      init.select_commit({ sha = "abc1234", oid = "abc1234full", message = "m", author = "dev" })
+      assert.is_true(state.is_commit_on_disk())
+
+      working_copy_parent = "elsewhere"
+      init.select_commit({ sha = "abc1234", oid = "abc1234full", message = "m", author = "dev" })
+      assert.is_false(state.is_commit_on_disk())
+
+      state.clear_active_commit()
+      assert.is_false(state.is_commit_on_disk())
     end)
 
     it("returns early with notification for nil commit", function()
@@ -940,6 +1128,172 @@ describe("init", function()
       assert.is_true(load_called)
     end)
 
+    it("opens the first file of the diff list once the PR is loaded", function()
+      gh.checkout = function(_, cb) cb(nil) end
+      init._load_pr_data = function(n, cb)
+        state.set_pr({ number = n, title = "T" })
+        -- Sidebar order: directories first, then by name.
+        state.set_files({
+          { path = "z.lua", status = "modified" },
+          { path = "lua/b.lua", status = "added" },
+          { path = "lua/a.lua", status = "modified" },
+        })
+        cb()
+      end
+      local opened
+      init._open_file = function(path) opened = path end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.checkout(42)
+
+      vim.notify = orig_notify
+      assert.are.equal("lua/a.lua", opened)
+    end)
+
+    it("opens the first file after a review from the PR list", function()
+      package.loaded["gh-review.ui.pr_picker"] = { last_scope = { kind = "all" }, show = function(o) init._shown = o end }
+      gh.checkout = function(_, cb) cb(nil) end
+      init._load_pr_data = function(n, cb)
+        state.set_pr({ number = n, title = "T" })
+        state.set_files({ { path = "a.lua", status = "modified" } })
+        cb()
+      end
+      local opened
+      init._open_file = function(path) opened = path end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.pr_list()
+      init._shown.on_select(42, {})
+
+      vim.notify = orig_notify
+      package.loaded["gh-review.ui.pr_picker"] = nil
+      assert.are.equal("a.lua", opened)
+    end)
+
+    it("opens the first file after reviewing the current branch", function()
+      gh.repo_name = function(cb) cb(nil, "o/r") end
+      gh.pr_view_current = function(cb) cb(nil, { number = 7, title = "T", headRefOid = "h", baseRefOid = "b" }) end
+      init._load_pr_data = function(n, cb)
+        state.set_pr({ number = n, title = "T" })
+        state.set_files({ { path = "b.lua", status = "modified" } })
+        cb()
+      end
+      local opened
+      init._open_file = function(path) opened = path end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.review_current()
+      vim.wait(200, function() return opened ~= nil end)
+
+      vim.notify = orig_notify
+      init._detected = nil
+      assert.are.equal("b.lua", opened)
+    end)
+
+    it("opens the files sidebar without focus once a review loads", function()
+      gh.checkout = function(_, cb) cb(nil) end
+      init._load_pr_data = function(n, cb)
+        state.set_pr({ number = n, title = "T" })
+        state.set_files({ { path = "a.lua", status = "modified" } })
+        cb()
+      end
+      init._open_file = function() end
+      local files = package.loaded["gh-review.ui.files"]
+      local shown
+      files.show = function(opts) shown = opts end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.checkout(42)
+
+      vim.notify = orig_notify
+      assert.are.same({ focus = false }, shown)
+    end)
+
+    it("leaves the sidebar closed when open_files_on_load is off", function()
+      config.setup({ open_files_on_load = false })
+      state.set_pr({ number = 1, title = "T" })
+      state.set_files({ { path = "a.lua", status = "modified" } })
+      init._open_file = function() end
+      local shown = false
+      package.loaded["gh-review.ui.files"].show = function() shown = true end
+      init._after_review_load()
+      assert.is_false(shown)
+    end)
+
+    it("leaves the files closed when open_first_file is off", function()
+      config.setup({ open_first_file = false })
+      gh.checkout = function(_, cb) cb(nil) end
+      init._load_pr_data = function(n, cb)
+        state.set_pr({ number = n, title = "T" })
+        state.set_files({ { path = "a.lua", status = "modified" } })
+        cb()
+      end
+      local opened = false
+      init._open_file = function() opened = true end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.checkout(42)
+
+      vim.notify = orig_notify
+      assert.is_false(opened)
+    end)
+
+    it("opens the first file over the start screen (snacks dashboard)", function()
+      state.set_pr({ number = 1, title = "T" })
+      state.set_files({ { path = "a.lua", status = "modified" } })
+      local dashboard = vim.api.nvim_create_buf(false, true)
+      vim.bo[dashboard].filetype = "snacks_dashboard"
+      local win = vim.api.nvim_get_current_win()
+      vim.api.nvim_win_set_buf(win, dashboard)
+      local opened_in
+      init._open_file = function() opened_in = vim.api.nvim_get_current_win() end
+
+      init._open_first_file()
+
+      vim.api.nvim_buf_delete(dashboard, { force = true })
+      assert.are.equal(win, opened_in)
+    end)
+
+    it("skips a picker window such as the files sidebar", function()
+      state.set_pr({ number = 1, title = "T" })
+      state.set_files({ { path = "a.lua", status = "modified" } })
+      local normal = vim.api.nvim_get_current_win()
+      vim.cmd("vsplit")
+      local sidebar = vim.api.nvim_get_current_win()
+      local list = vim.api.nvim_create_buf(false, true)
+      vim.bo[list].filetype = "snacks_picker_list"
+      vim.api.nvim_win_set_buf(sidebar, list)
+      local opened_in
+      init._open_file = function() opened_in = vim.api.nvim_get_current_win() end
+
+      init._open_first_file()
+
+      vim.api.nvim_win_close(sidebar, true)
+      vim.api.nvim_buf_delete(list, { force = true })
+      assert.are.equal(normal, opened_in)
+    end)
+
+    it("opens the first file in a normal window, not in a floating one", function()
+      state.set_pr({ number = 1, title = "T" })
+      state.set_files({ { path = "a.lua", status = "modified" } })
+      local normal = vim.api.nvim_get_current_win()
+      local float_buf = vim.api.nvim_create_buf(false, true)
+      local float = vim.api.nvim_open_win(float_buf, true, { relative = "editor", row = 1, col = 1, width = 10, height = 2 })
+      local opened_in
+      init._open_file = function() opened_in = vim.api.nvim_get_current_win() end
+
+      init._open_first_file()
+
+      vim.api.nvim_win_close(float, true)
+      vim.api.nvim_buf_delete(float_buf, { force = true })
+      assert.are.equal(normal, opened_in)
+    end)
+
     it("notifies and stops on checkout error", function()
       gh.checkout = function(_, cb)
         cb("branch not found")
@@ -961,6 +1315,25 @@ describe("init", function()
         if n.msg:find("checkout failed") then found = true end
       end
       assert.is_true(found)
+    end)
+  end)
+
+  describe("_refresh_views with a follow-up", function()
+    it("runs it, then reopens the files sidebar without taking the focus", function()
+      local order = {}
+      local files = package.loaded["gh-review.ui.files"]
+      files.show = function(opts) table.insert(order, { "show", opts }) end
+      init._refresh_views(function() table.insert(order, { "after" }) end)
+      vim.wait(300, function() return #order == 2 end)
+      assert.are.same({ { "after" }, { "show", { focus = false } } }, order)
+    end)
+
+    it("reopens the sidebar as before without one", function()
+      local shown
+      package.loaded["gh-review.ui.files"].show = function(opts) shown = { opts = opts } end
+      init._refresh_views()
+      vim.wait(300, function() return shown ~= nil end)
+      assert.is_nil(shown.opts)
     end)
   end)
 
@@ -1098,6 +1471,9 @@ describe("init", function()
       orig_vcs.jj_change_id = vcs.jj_change_id
       orig_vcs.jj_downstream_bookmarks = vcs.jj_downstream_bookmarks
       orig_vcs.head_rev = vcs.head_rev
+      orig_vcs.jj_move_to = vcs.jj_move_to
+      -- The working copy is already on every commit unless a test says otherwise.
+      vcs.jj_move_to = function(_, cb) cb(nil, false) end
     end)
 
     after_each(function()
@@ -1133,6 +1509,18 @@ describe("init", function()
       vim.notify = orig_notify
       assert.is_false(spawned)
       assert.is_truthy(notifications[1]:find("jj workspace"))
+    end)
+
+    it("opens the first file of the commit a step lands on", function()
+      set_pr("aaa1111full")
+      state.set_active_commit({ sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" })
+      stub_jj({ { commit_id = "bbb2222full", bookmarks = {}, description = "second" } })
+      local after_passed
+      init.select_commit = function(_, after) after_passed = after end
+
+      init.next_stack_commit()
+
+      assert.are.equal(init._open_first_file, after_passed)
     end)
 
     it("filters to the child commit when it belongs to the loaded PR", function()
@@ -1362,6 +1750,195 @@ describe("init", function()
       assert.is_truthy(formatted:find("feat/a", 1, true))
       assert.are.equal("ddd4444full", selected.oid)
     end)
+
+    it("checks the commit out in jj before moving the review", function()
+      set_pr("aaa1111full")
+      local order = {}
+      vcs.jj_move_to = function(rev, cb)
+        table.insert(order, "move " .. rev)
+        cb(nil, true)
+      end
+      init.select_commit = function(commit) table.insert(order, "select " .. commit.oid) end
+
+      init._goto_stack_commit({ commit_id = "bbb2222full", bookmarks = {}, description = "second" })
+
+      assert.are.same({ "move bbb2222full", "select bbb2222full" }, order)
+    end)
+
+    describe("from the stack picker", function()
+      local opts = { whole_pr_at_tip = true }
+
+      it("shows the whole PR when the commit is the PR tip", function()
+        set_pr("bbb2222full")
+        state.set_active_commit({ sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" })
+        local filtered = false
+        init.select_commit = function() filtered = true end
+        local refreshed = false
+        init._refresh_views = function() refreshed = true end
+        local orig_notify = vim.notify
+        vim.notify = function() end
+
+        -- Rewritten locally: the commit id is new, the head branch tells.
+        init._goto_stack_commit({ commit_id = "eee5555full", bookmarks = { "f" }, description = "second" }, opts)
+
+        vim.notify = orig_notify
+        assert.is_false(filtered)
+        assert.is_true(refreshed)
+        assert.is_nil(state.get_active_commit())
+      end)
+
+      it("opens the first file of the whole PR once the views are rebuilt", function()
+        set_pr("bbb2222full")
+        state.set_files({ { path = "z.lua", status = "modified" }, { path = "a.lua", status = "added" } })
+        local after
+        init._refresh_views = function(cb) after = cb end
+        local opened
+        init._open_file = function(path) opened = path end
+        local orig_notify = vim.notify
+        vim.notify = function() end
+
+        init._goto_stack_commit(
+          { commit_id = "eee5555full", bookmarks = { "f" }, description = "second" },
+          { whole_pr_at_tip = true, open_first_file = true }
+        )
+        after()
+
+        vim.notify = orig_notify
+        assert.are.equal("a.lua", opened)
+      end)
+
+      it("opens the first file of the commit it filters to", function()
+        set_pr("bbb2222full")
+        local after_passed
+        init.select_commit = function(_, after) after_passed = after end
+
+        init._goto_stack_commit(
+          { commit_id = "aaa1111full", bookmarks = {}, description = "first" },
+          { whole_pr_at_tip = true, open_first_file = true }
+        )
+
+        assert.are.equal(init._open_first_file, after_passed)
+      end)
+
+      it("opens nothing when the caller does not ask for it", function()
+        set_pr("bbb2222full")
+        local after_passed = "unset"
+        init.select_commit = function(_, after) after_passed = after end
+
+        init._goto_stack_commit({ commit_id = "aaa1111full", bookmarks = {}, description = "first" })
+
+        assert.is_nil(after_passed)
+      end)
+
+      it("still filters to a commit inside the PR", function()
+        set_pr("bbb2222full")
+        local selected
+        init.select_commit = function(commit) selected = commit end
+
+        init._goto_stack_commit({ commit_id = "aaa1111full", bookmarks = {}, description = "first" }, opts)
+
+        assert.are.equal("aaa1111full", selected.oid)
+      end)
+
+      it("loads another PR whole when the commit is its tip", function()
+        set_pr("bbb2222full")
+        vcs.jj_downstream_bookmarks = function(_, cb) cb(nil, { "feat/two" }) end
+        gh.pr_view_branch = function(_, cb) cb(nil, { number = 43, title = "Second PR" }) end
+        init._load_pr_data = function(n, cb)
+          state.set_pr({ number = n, title = "Second PR", head_ref = "feat/two", head_sha = "fff6666full" })
+          state.set_commits({ { sha = "ccc3333", oid = "ccc3333full", message = "third", author = "dev" } })
+          cb()
+        end
+        local filtered = false
+        init.select_commit = function() filtered = true end
+        local refreshed = false
+        init._refresh_views = function() refreshed = true end
+        local orig_notify = vim.notify
+        vim.notify = function() end
+
+        init._goto_stack_commit({ commit_id = "ccc3333full", bookmarks = { "feat/two" }, description = "third" }, opts)
+
+        vim.notify = orig_notify
+        assert.is_false(filtered)
+        assert.is_true(refreshed)
+        assert.are.equal(43, state.get_pr().number)
+      end)
+    end)
+
+    it("still moves the review when the checkout fails", function()
+      set_pr("aaa1111full")
+      vcs.jj_move_to = function(_, cb) cb("working copy is stale") end
+      local selected
+      init.select_commit = function(commit) selected = commit end
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init._goto_stack_commit({ commit_id = "bbb2222full", bookmarks = {}, description = "second" })
+
+      vim.notify = orig_notify
+      assert.are.equal("bbb2222full", selected.oid)
+      assert.is_truthy(notifications[1]:find("working copy is stale", 1, true))
+    end)
+  end)
+
+  describe("toggle_local_diff", function()
+    local vcs = require("gh-review.vcs")
+    local orig_jj_root
+
+    before_each(function()
+      orig_jj_root = vcs.jj_root
+      state.set_pr({ number = 42, title = "T", head_ref = "f", base_ref = "main" })
+    end)
+
+    after_each(function()
+      vcs.jj_root = orig_jj_root
+    end)
+
+    it("turns the local diff on, drops the commit filter and reloads", function()
+      vcs.jj_root = function() return "/tmp/ws" end
+      state.set_active_commit({ sha = "aaa1111", oid = "aaa1111full", message = "first", author = "dev" })
+      local loaded
+      init._load_pr_data = function(n) loaded = n end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.toggle_local_diff()
+
+      vim.notify = orig_notify
+      assert.is_true(state.get_local_diff())
+      assert.is_nil(state.get_active_commit())
+      assert.are.equal(42, loaded)
+    end)
+
+    it("turns it back off", function()
+      vcs.jj_root = function() return "/tmp/ws" end
+      state.set_local_diff(true)
+      init._load_pr_data = function() end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.toggle_local_diff()
+
+      vim.notify = orig_notify
+      assert.is_false(state.get_local_diff())
+    end)
+
+    it("refuses outside jj", function()
+      vcs.jj_root = function() return nil end
+      local loaded = false
+      init._load_pr_data = function() loaded = true end
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.toggle_local_diff()
+
+      vim.notify = orig_notify
+      assert.is_false(state.get_local_diff())
+      assert.is_false(loaded)
+      assert.is_truthy(notifications[1]:find("jj workspace"))
+    end)
   end)
 
   describe("stack_panel", function()
@@ -1565,13 +2142,195 @@ describe("init", function()
       vcs.head_rev = function() return "wwww9999" end
       local picked = { commit_id = "ccc3333full", bookmarks = {}, description = "third" }
       vcs.jj_stack = function(_, cb) cb(nil, { picked }, false) end
-      local navigated
-      init._goto_stack_commit = function(commit) navigated = commit end
+      local navigated, nav_opts
+      init._goto_stack_commit = function(commit, opts) navigated, nav_opts = commit, opts end
 
       init.stack_panel()
       shown.opts.on_select(picked)
 
       assert.are.equal("ccc3333full", navigated.commit_id)
+      assert.are.same({ whole_pr_at_tip = true, open_first_file = true }, nav_opts)
+    end)
+  end)
+
+  describe("review_current with a known PR", function()
+    local vcs_mod, orig_base_commit, loads, views
+
+    before_each(function()
+      vcs_mod = require("gh-review.vcs")
+      orig_base_commit = vcs_mod.base_commit
+      vcs_mod.base_commit = function() return "c1" end
+      loads, views = {}, {}
+      init._load_pr_data = function(n, cb, hint, meta)
+        table.insert(loads, { n = n, hint = hint, meta = meta, cb = cb })
+        state.set_pr({ number = n, title = meta.title, body = meta.body or "" })
+      end
+      gh.pr_view = function(n, cb) table.insert(views, { n = n, cb = cb }) end
+      gh.repo_name = function(cb) cb(nil, "org/repo") end
+    end)
+
+    after_each(function()
+      vcs_mod.base_commit = orig_base_commit
+      init._detected = nil
+    end)
+
+    local data = { number = 9, title = "T", headRefOid = "h", baseRefOid = "b" }
+
+    it("loads saved metadata at once, with no time limit, and keeps it for next time", function()
+      local looked_up = false
+      gh.pr_view_current = function() looked_up = true end
+      init._detected = { data = data, head = "c1" }
+      init.review_current()
+      assert.is_false(looked_up)
+      assert.are.equal(9, loads[1].n)
+      assert.are.equal(data, loads[1].meta)
+      assert.are.same({ head_oid = "h", base_oid = "b" }, loads[1].hint)
+      -- Checked in the background.
+      assert.are.equal(9, views[1].n)
+      loads[1].cb()
+      views[1].cb(nil, vim.tbl_extend("force", data, { title = "New title" }))
+      assert.are.equal(1, #loads) -- same commits: no reload
+      assert.are.equal("New title", state.get_pr().title)
+      assert.are.equal("New title", init._detected.data.title)
+    end)
+
+    it("reloads once the first load is done when the PR moved on GitHub", function()
+      init._detected = { data = data, head = "c1" }
+      init.review_current()
+      local moved = vim.tbl_extend("force", data, { headRefOid = "h2" })
+      views[1].cb(nil, moved)
+      assert.are.equal(1, #loads) -- waits for the first load
+      loads[1].cb()
+      assert.are.equal(2, #loads)
+      assert.are.same({ head_oid = "h2", base_oid = "b" }, loads[2].hint)
+    end)
+
+    it("looks the PR up again when the working copy moved, and remembers the answer", function()
+      local lookups = 0
+      gh.pr_view_current = function(cb) lookups = lookups + 1; cb(nil, data) end
+      init._detected = { data = data, head = "other" }
+      init.review_current()
+      assert.are.equal(1, lookups)
+      vim.wait(100, function() return #loads == 1 end)
+      -- The lookup's metadata is passed on too: no second pr_view.
+      assert.are.equal(data, loads[1].meta)
+      assert.are.same({ data = data, head = "c1" }, init._detected)
+    end)
+
+    it("is dropped when the cwd changes", function()
+      init.setup()
+      init._detected = { data = data, head = "c1" }
+      vim.api.nvim_exec_autocmds("DirChanged", { pattern = "*" })
+      assert.is_nil(init._detected)
+    end)
+  end)
+
+  describe("_reload_open_views", function()
+    local files, commits, shown, closed_views, orig_defer
+
+    before_each(function()
+      files = package.loaded["gh-review.ui.files"]
+      commits = require("gh-review.ui.commits")
+      shown = {}
+      closed_views = {}
+      files.is_open = function() return true end
+      files.show = function() table.insert(shown, "files") end
+      commits.is_open = function() return false end
+      package.loaded["gh-review.ui.diff_review"].close = function() table.insert(closed_views, "split") end
+      orig_defer = vim.defer_fn
+      vim.defer_fn = function(fn) fn() end
+    end)
+
+    after_each(function()
+      vim.defer_fn = orig_defer
+      package.loaded["gh-review.ui.commits"] = nil
+      init._loaded_pr_number = nil
+    end)
+
+    it("rebuilds the open file sidebar when another PR finishes loading", function()
+      state.set_pr(make_pr({ number = 7 }))
+      init._loaded_pr_number = 6
+      init._finish_load({}, nil)
+      assert.are.same({ "files" }, shown)
+      assert.are.same({ "split" }, closed_views)
+      assert.are.equal(7, init._loaded_pr_number)
+    end)
+
+    it("refreshes the sidebar but keeps the diff split on a reload of the same PR", function()
+      state.set_pr(make_pr({ number = 7 }))
+      init._loaded_pr_number = 7
+      init._finish_load({}, nil)
+      assert.are.same({ "files" }, shown)
+      assert.are.same({}, closed_views)
+    end)
+
+    it("leaves closed sidebars closed", function()
+      files.is_open = function() return false end
+      state.set_pr(make_pr({ number = 8 }))
+      init._finish_load({}, nil)
+      assert.are.same({}, shown)
+    end)
+  end)
+
+  describe("_sync_gh_repo_env", function()
+    local vcs_mod, orig_context, orig_env
+
+    before_each(function()
+      vcs_mod = require("gh-review.vcs")
+      orig_context = vcs_mod.context
+      orig_env = vim.env.GH_REPO
+      vim.env.GH_REPO = nil
+      init._exported_gh_repo = nil
+    end)
+
+    after_each(function()
+      vcs_mod.context = orig_context
+      vim.env.GH_REPO = orig_env
+      init._exported_gh_repo = nil
+    end)
+
+    it("exports the repo of a jj workspace without a git worktree, and takes it back", function()
+      vcs_mod.context = function() return { kind = "jj", gh_cwd = "/main" } end
+      gh.repo_name = function(cb) cb(nil, "o/r") end
+      init._sync_gh_repo_env()
+      assert.are.equal("o/r", vim.env.GH_REPO)
+      vcs_mod.context = function() return { kind = "git" } end
+      init._sync_gh_repo_env()
+      assert.is_nil(vim.env.GH_REPO)
+    end)
+
+    it("uses the store's remote for a bare jj store without asking gh", function()
+      vcs_mod.context = function() return { kind = "jj", gh_env = { GH_REPO = "x/y" } } end
+      gh.repo_name = function() error("should not be called") end
+      init._sync_gh_repo_env()
+      assert.are.equal("x/y", vim.env.GH_REPO)
+    end)
+
+    it("never touches a GH_REPO the user set, and does nothing in git worktrees", function()
+      vim.env.GH_REPO = "mine/repo"
+      vcs_mod.context = function() return { kind = "jj", gh_env = { GH_REPO = "x/y" } } end
+      init._sync_gh_repo_env()
+      assert.are.equal("mine/repo", vim.env.GH_REPO)
+      vcs_mod.context = function() return { kind = "git" } end
+      init._sync_gh_repo_env()
+      assert.are.equal("mine/repo", vim.env.GH_REPO)
+    end)
+
+    it("ignores an answer for a directory already left, and can be turned off", function()
+      vcs_mod.context = function() return { kind = "jj", gh_cwd = "/main" } end
+      local pending
+      gh.repo_name = function(cb) pending = cb end
+      init._sync_gh_repo_env()
+      local orig_getcwd = vim.fn.getcwd
+      vim.fn.getcwd = function() return "/elsewhere" end
+      pending(nil, "o/r")
+      vim.fn.getcwd = orig_getcwd
+      assert.is_nil(vim.env.GH_REPO)
+
+      config.setup({ export_gh_repo = false })
+      vcs_mod.context = function() return { kind = "jj", gh_env = { GH_REPO = "x/y" } } end
+      init._sync_gh_repo_env()
+      assert.is_nil(vim.env.GH_REPO)
     end)
   end)
 
@@ -1898,6 +2657,107 @@ describe("init", function()
         if n.msg:find("PR node ID not available") then found = true end
       end
       assert.is_true(found)
+    end)
+  end)
+
+  describe("suggest_change", function()
+    local orig_rel_path, input_opts, buf
+
+    before_each(function()
+      orig_rel_path = init._current_rel_path
+      init._current_rel_path = function() return "src/a.lua" end
+      package.loaded["gh-review.ui.comment_input"] = {
+        open = function(opts) input_opts = opts end,
+      }
+      input_opts = nil
+      state.set_pr({ number = 42, title = "T", head_ref = "f", head_sha = "H", repository = "o/r", node_id = "PR_id" })
+      buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "one", "two", "three" })
+      vim.api.nvim_set_current_buf(buf)
+    end)
+
+    after_each(function()
+      init._current_rel_path = orig_rel_path
+      package.loaded["gh-review.ui.comment_input"] = nil
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("opens a pending thread on a suggestion block of the selected lines", function()
+      local created
+      graphql.create_thread = function(pr_id, path, line, side, body, cb, start_line)
+        created = { pr_id = pr_id, path = path, line = line, side = side, body = body, start_line = start_line }
+        cb(nil)
+      end
+      init.refresh = function() end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.suggest_change(2, 3)
+      assert.is_truthy(input_opts.title:find("Suggest Change: src/a.lua:2-3", 1, true))
+      assert.are.same({ "```suggestion", "two", "three", "```" }, input_opts.body_lines)
+      assert.are.equal(2, input_opts.cursor_line)
+      assert.are.same({ "two", "three" }, input_opts.suggestion_lines)
+      input_opts.on_submit("```suggestion\nTWO\nthree\n```")
+
+      vim.notify = orig_notify
+      assert.are.same({
+        pr_id = "PR_id", path = "src/a.lua", line = 3, side = "RIGHT",
+        body = "```suggestion\nTWO\nthree\n```", start_line = 2,
+      }, created)
+    end)
+
+    it("refuses on the base side of the split", function()
+      vim.api.nvim_buf_set_name(buf, "ghreview://base/src/a.lua")
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      init.suggest_change(1, 1)
+
+      vim.notify = orig_notify
+      assert.is_nil(input_opts)
+      assert.is_truthy(notifications[1]:find("new side of the diff", 1, true))
+    end)
+
+    it("posts a direct suggestion immediately", function()
+      local posted
+      gh.pr_add_review_comment = function(n, opts, cb)
+        posted = { n = n, opts = opts }
+        cb(nil)
+      end
+      local thread_created = false
+      graphql.create_thread = function() thread_created = true end
+      init.refresh = function() end
+      local orig_notify = vim.notify
+      vim.notify = function() end
+
+      init.suggest_change_direct(1, 2)
+      assert.is_truthy(input_opts.title:find("Suggest Change (direct): src/a.lua:1-2", 1, true))
+      assert.are.same({ "```suggestion", "one", "two", "```" }, input_opts.body_lines)
+      input_opts.on_submit("```suggestion\nONE\ntwo\n```")
+
+      vim.notify = orig_notify
+      assert.is_false(thread_created)
+      assert.are.equal(42, posted.n)
+      assert.are.equal("H", posted.opts.commit_id)
+      assert.are.equal(1, posted.opts.start_line)
+      assert.are.equal(2, posted.opts.line)
+      assert.are.equal("```suggestion\nONE\ntwo\n```", posted.opts.body)
+    end)
+
+    it("refuses a direct suggestion on the base side too", function()
+      vim.api.nvim_buf_set_name(buf, "ghreview://base/src/a.lua")
+      local orig_notify = vim.notify
+      vim.notify = function() end
+      init.suggest_change_direct(1, 1)
+      vim.notify = orig_notify
+      assert.is_nil(input_opts)
+    end)
+
+    it("lets a plain comment insert a suggestion of the commented lines", function()
+      init.new_thread(1, 2)
+      assert.is_nil(input_opts.body_lines)
+      assert.are.same({ "one", "two" }, input_opts.suggestion_lines)
     end)
   end)
 
@@ -3097,6 +3957,520 @@ describe("init", function()
       vim.wait(100)
       assert.are.equal(1, polls)
       assert.are.same({ "next" }, goto_calls)
+    end)
+  end)
+
+  describe("file sync autocmd", function()
+    local synced
+
+    before_each(function()
+      synced = {}
+      package.loaded["gh-review.ui.files"].sync_current = function(bufnr)
+        table.insert(synced, bufnr)
+      end
+      -- Keep `setup` from shelling out to `gh` for background PR detection.
+      init._pr_detection_notified = true
+      init.setup()
+    end)
+
+    after_each(function()
+      pcall(vim.api.nvim_del_augroup_by_name, "GHReviewFileSync")
+    end)
+
+    it("registers a buffer-switch hook", function()
+      local autocmds = vim.api.nvim_get_autocmds({ group = "GHReviewFileSync" })
+      local events = {}
+      for _, au in ipairs(autocmds) do
+        events[au.event] = true
+      end
+      assert.is_true(events.BufEnter)
+      assert.is_true(events.BufWinEnter)
+    end)
+
+    it("syncs the sidebar to the buffer entered while a review is active", function()
+      state.set_pr(make_pr())
+      local buf = vim.api.nvim_create_buf(false, true)
+
+      vim.api.nvim_exec_autocmds("BufEnter", { buffer = buf })
+
+      assert.are.same({ buf }, synced)
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("does nothing when no review is active", function()
+      local buf = vim.api.nvim_create_buf(false, true)
+
+      vim.api.nvim_exec_autocmds("BufEnter", { buffer = buf })
+
+      assert.are.same({}, synced)
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+  end)
+  describe("native GitHub stacks", function()
+    local ui_calls, notes, orig_notify, orig_select, orig_defer
+
+    --- Raw GraphQL stack with PRs { number, overrides }, bottom first
+    local function raw_stack(prs)
+      local nodes = {}
+      for i, p in ipairs(prs) do
+        table.insert(nodes, {
+          position = i,
+          pullRequest = vim.tbl_extend("force", {
+            number = p[1], title = "PR " .. p[1], state = "OPEN", isDraft = false,
+            author = { login = "dev" }, headRefName = "b" .. p[1], headRefOid = "sha" .. p[1],
+            baseRefOid = "base" .. p[1],
+            mergeable = "MERGEABLE", mergeStateStatus = "CLEAN", reviewDecision = "APPROVED",
+            statusCheckRollup = { state = "SUCCESS" },
+          }, p[2] or {}),
+        })
+      end
+      return { number = 4, size = #prs, baseRefName = "main", entries = { nodes = nodes } }
+    end
+
+    --- Parse a raw stack and apply the status its PR nodes carry
+    local function parsed(raw)
+      local gs = require("gh-review.gh_stack")
+      local stack = gs.parse_stack(raw)
+      local statuses = {}
+      for _, n in ipairs(raw.entries.nodes) do statuses[n.pullRequest.number] = gs.parse_status(n.pullRequest) end
+      gs.apply_statuses(stack, statuses)
+      return stack
+    end
+
+    --- Status nodes for `graphql.fetch_pr_statuses`, from a raw stack
+    local function status_nodes(raw)
+      local nodes = {}
+      for _, n in ipairs(raw.entries.nodes) do nodes[n.pullRequest.number] = n.pullRequest end
+      return nodes
+    end
+
+    local function has_note(pattern)
+      for _, n in ipairs(notes) do
+        if n.msg:find(pattern, 1, true) then return n end
+      end
+      return nil
+    end
+
+    before_each(function()
+      ui_calls = {}
+      notes = {}
+      orig_notify = vim.notify
+      vim.notify = function(msg, level) table.insert(notes, { msg = msg, level = level }) end
+      orig_select = vim.ui.select
+      orig_defer = vim.defer_fn
+      package.loaded["gh-review.ui.gh_stack"] = {
+        show_list = function(stacks, opts) ui_calls.list = { stacks = stacks, opts = opts } end,
+        show_panel = function(stack, opts) ui_calls.panel = { stack = stack, opts = opts } end,
+        close_panel = function() return ui_calls.panel_open == true end,
+        panel_title = function(stack) return "stack #" .. stack.number end,
+      }
+      gh.repo_name = function(cb) cb(nil, "org/repo") end
+      require("gh-review.cache").clear()
+    end)
+
+    after_each(function()
+      vim.notify = orig_notify
+      vim.ui.select = orig_select
+      vim.defer_fn = orig_defer
+      package.loaded["gh-review.ui.gh_stack"] = nil
+      package.loaded["gh-review.ui.pr_picker"] = nil
+    end)
+
+    describe("pr_list", function()
+      it("opens the PR picker on the last scope with review and checkout actions", function()
+        local shown
+        package.loaded["gh-review.ui.pr_picker"] = {
+          last_scope = { kind = "mine" },
+          show = function(opts) shown = opts end,
+        }
+        init.pr_list()
+        assert.are.same({ kind = "mine" }, shown.scope)
+        assert.are.equal("PRs", shown.title)
+
+        local checked = {}
+        gh.checkout = function(n, cb) table.insert(checked, n); cb(nil) end
+        local loaded
+        init._load_pr_data = function(n) loaded = n end
+        shown.on_checkout(7)
+        assert.is_nil(loaded)
+        assert.is_truthy(has_note("checked out PR #7"))
+        local hint
+        init._load_pr_data = function(n, _, h) loaded = n; hint = h end
+        shown.on_select(8, { headRefOid = "h8", baseRefOid = "b8" })
+        assert.are.same({ 7, 8 }, checked)
+        assert.are.equal(8, loaded)
+        assert.are.same({ head_oid = "h8", base_oid = "b8" }, hint)
+      end)
+
+      it("reviews the first or last open PR of mine in a stack", function()
+        local gh_stack = require("gh-review.gh_stack")
+        local stack = gh_stack.parse_stack({ number = 5, entries = { nodes = {
+          { position = 1, pullRequest = { number = 1, author = { login = "me" }, state = "MERGED" } },
+          { position = 2, pullRequest = { number = 2, author = { login = "me" }, state = "OPEN", headRefName = "b2", headRefOid = "h2" } },
+          { position = 3, pullRequest = { number = 3, author = { login = "you" }, state = "OPEN" } },
+          { position = 4, pullRequest = { number = 4, author = { login = "me" }, state = "OPEN" } },
+        } } })
+        gh.viewer_login = function(cb) cb(nil, "me") end
+        local checked = {}
+        gh.checkout = function(n, cb, hint) table.insert(checked, { n = n, hint = hint }) end
+        init._review_own_stack_pr(stack, "first")
+        init._review_own_stack_pr(stack, "last")
+        assert.are.same({
+          { n = 2, hint = { head_oid = "h2", head_ref = "b2" } },
+          { n = 4, hint = {} },
+        }, checked)
+
+        gh.viewer_login = function(cb) cb(nil, "them") end
+        init._review_own_stack_pr(stack, "first")
+        assert.are.equal(2, #checked)
+        assert.is_truthy(has_note("has no open PR of yours"))
+      end)
+
+      it("passes the stack keys to the PR and stack pickers", function()
+        local shown
+        package.loaded["gh-review.ui.pr_picker"] = { last_scope = { kind = "all" }, show = function(o) shown = o end }
+        init.pr_list()
+        assert.are.equal(init._review_own_stack_pr, shown.on_own_stack_pr)
+      end)
+
+      it("uses an explicit scope", function()
+        local shown
+        package.loaded["gh-review.ui.pr_picker"] = { last_scope = { kind = "all" }, show = function(o) shown = o end }
+        init.pr_list({ kind = "review" })
+        assert.are.same({ kind = "review" }, shown.scope)
+      end)
+    end)
+
+    describe("gh_stacks", function()
+      it("groups search results into stacks and opens the list", function()
+        local terms = {}
+        graphql.search_stacked_prs = function(owner, name, term, cb)
+          assert.are.equal("org", owner)
+          assert.are.equal("repo", name)
+          table.insert(terms, term)
+          local raw = raw_stack({ { 1 }, { 2 } })
+          cb(nil, { { number = 1, stack = raw }, { number = 2, stack = raw } })
+        end
+        local asked
+        graphql.fetch_pr_statuses = function(_, _, numbers, cb)
+          asked = numbers
+          -- The list is drawn before the statuses arrive.
+          assert.are.equal("loading", ui_calls.list and ui_calls.list.stacks[1].entries[1].status or "loading")
+          cb(nil, status_nodes(raw_stack({ { 1 }, { 2 } })))
+        end
+        init.gh_stacks({ kind = "mine" })
+        assert.are.same({ "author:@me" }, terms)
+        assert.are.same({ 1, 2 }, asked)
+        assert.are.equal(1, #ui_calls.list.stacks)
+        assert.are.equal("ready", ui_calls.list.stacks[1].entries[2].status)
+        assert.are.same({ kind = "mine" }, init._last_stack_scope)
+
+        local opened
+        init.gh_stack_panel = function(n) opened = n end
+        ui_calls.list.opts.on_select(ui_calls.list.stacks[1])
+        assert.are.equal(2, opened)
+      end)
+
+      it("explains when the host has no native stacks", function()
+        graphql.search_stacked_prs = function(_, _, _, cb)
+          cb("gh: Field 'stack' doesn't exist on type 'PullRequest'", nil)
+        end
+        init.gh_stacks()
+        local n = has_note("not available on this GitHub host")
+        assert.is_truthy(n)
+        assert.are.equal(vim.log.levels.WARN, n.level)
+      end)
+
+      it("suggests a narrower scope when GitHub times out", function()
+        graphql.search_stacked_prs = function(_, _, _, cb)
+          cb(nil, { { number = 1, stack = raw_stack({ { 1 } }) } })
+        end
+        graphql.fetch_pr_statuses = function(_, _, _, cb) cb("gh: HTTP 502", nil) end
+        init.gh_stacks({ kind = "all" })
+        assert.is_truthy(has_note("GitHub timed out loading stacks; narrow the scope"))
+      end)
+
+      it("reports when no stack matches", function()
+        graphql.search_stacked_prs = function(_, _, _, cb) cb(nil, {}) end
+        init.gh_stacks({ kind = "all" })
+        assert.is_truthy(has_note("no GitHub stacks found (all open)"))
+        assert.is_nil(ui_calls.list)
+      end)
+
+      it("reports repo resolution errors", function()
+        gh.repo_name = function(cb) cb("no remote", nil) end
+        init.gh_stacks()
+        assert.is_truthy(has_note("could not resolve the repository: no remote"))
+      end)
+    end)
+
+    describe("gh_stack_panel", function()
+      local settings = { methods = { "squash" }, merge_queue = false }
+
+      it("opens the stack of the PR under review", function()
+        state.set_pr(make_pr({ number = 2 }))
+        local asked
+        graphql.fetch_pr_stack = function(_, _, n, cb)
+          asked = n
+          cb(nil, raw_stack({ { 1 }, { 2 } }), settings)
+        end
+        init.gh_stack_panel()
+        assert.are.equal(2, asked)
+        assert.are.equal(2, ui_calls.panel.opts.current_pr)
+        assert.are.equal(4, ui_calls.panel.stack.number)
+      end)
+
+      it("toggles closed when a panel is open", function()
+        ui_calls.panel_open = true
+        local fetched = false
+        graphql.fetch_pr_stack = function() fetched = true end
+        init.gh_stack_panel()
+        assert.is_false(fetched)
+      end)
+
+      it("falls back to the PR of the current branch", function()
+        gh.pr_view_current = function(cb) cb(nil, { number = 9 }) end
+        local asked
+        graphql.fetch_pr_stack = function(_, _, n, cb) asked = n; cb(nil, nil, settings) end
+        init.gh_stack_panel()
+        assert.are.equal(9, asked)
+        assert.is_truthy(has_note("PR #9 is not part of a GitHub stack"))
+      end)
+
+      it("warns when there is no PR to start from", function()
+        gh.pr_view_current = function(cb) cb("no pr", nil) end
+        init.gh_stack_panel()
+        assert.is_truthy(has_note("no PR under review or for the current branch"))
+      end)
+
+      it("refresh refetches and merge goes through _merge_stack", function()
+        local fetches = 0
+        graphql.fetch_pr_stack = function(_, _, _, cb)
+          fetches = fetches + 1
+          cb(nil, raw_stack({ { 1 }, { 2 } }), settings)
+        end
+        init.gh_stack_panel(1)
+        ui_calls.panel.opts.on_refresh()
+        assert.are.equal(2, fetches)
+
+        local merged
+        init._merge_stack = function(repo, stack, s, pos) merged = { repo, stack.number, s, pos } end
+        ui_calls.panel.opts.on_merge({ position = 2 })
+        assert.are.same({ "org/repo", 4, settings, 2 }, merged)
+      end)
+    end)
+
+    describe("lazy panel and checks", function()
+      it("draws the panel before statuses, then applies them and wires details", function()
+        state.set_pr(make_pr({ number = 2 }))
+        graphql.fetch_pr_stack = function(_, _, _, cb)
+          cb(nil, raw_stack({ { 1 }, { 2 } }), { methods = { "squash" }, merge_queue = false })
+        end
+        local status_cb
+        graphql.fetch_pr_statuses = function(_, _, numbers, cb)
+          assert.are.same({ 1, 2 }, numbers)
+          status_cb = cb
+        end
+        init.gh_stack_panel()
+        local stack = ui_calls.panel.stack
+        assert.are.equal("loading", stack.entries[1].status)
+        status_cb(nil, status_nodes(raw_stack({ { 1 }, { 2 } })))
+        assert.are.equal("ready", stack.entries[1].status)
+
+        local shown
+        init._show_checks = function(repo, pr) shown = { repo, pr.number } end
+        ui_calls.panel.opts.on_details(stack.entries[2])
+        assert.are.same({ "org/repo", 2 }, shown)
+      end)
+
+      it("reviews a panel entry with its commits as the hint", function()
+        graphql.fetch_pr_stack = function(_, _, _, cb) cb(nil, raw_stack({ { 1 } }), { methods = {}, merge_queue = false }) end
+        graphql.fetch_pr_statuses = function(_, _, _, cb) cb(nil, {}) end
+        init.gh_stack_panel(1)
+        local got
+        init.checkout = function(n, hint) got = { n, hint } end
+        ui_calls.panel.opts.on_review(ui_calls.panel.stack.entries[1])
+        assert.are.same({ 1, { head_oid = "sha1", base_oid = "base1", head_ref = "b1" } }, got)
+      end)
+
+      it("refresh skips the status cache", function()
+        graphql.fetch_pr_stack = function(_, _, _, cb) cb(nil, raw_stack({ { 1 } }), { methods = {}, merge_queue = false }) end
+        local fetches = 0
+        graphql.fetch_pr_statuses = function(_, _, _, cb)
+          fetches = fetches + 1
+          cb(nil, status_nodes(raw_stack({ { 1 } })))
+        end
+        init.gh_stack_panel(1)
+        init.gh_stack_panel(1) -- settled status now cached
+        assert.are.equal(1, fetches)
+        ui_calls.panel.opts.on_refresh()
+        assert.are.equal(2, fetches)
+      end)
+
+      it("_show_checks fetches, caches settled checks, and refetches on demand", function()
+        local windows = {}
+        package.loaded["gh-review.ui.pr_checks"] = {
+          open = function(pr, opts)
+            local w = { pr = pr, opts = opts }
+            w.set = function(r) w.result = r end
+            w.set_error = function(e) w.err = e end
+            table.insert(windows, w)
+            return w
+          end,
+        }
+        local fetches = 0
+        graphql.fetch_pr_checks = function(owner, name, n, cb)
+          fetches = fetches + 1
+          assert.are.same({ "org", "repo", 3 }, { owner, name, n })
+          cb(nil, { head_oid = "h3", checks = { { name = "t", state = "FAILURE", required = true } } })
+        end
+        local pr = { number = 3, title = "T", head_oid = "h3" }
+        init._show_checks("org/repo", pr)
+        assert.are.equal("FAILURE", windows[1].result.checks[1].state)
+        init._show_checks("org/repo", pr)
+        assert.are.equal(1, fetches)
+        assert.are.equal("FAILURE", windows[2].result.checks[1].state)
+        windows[2].opts.on_refresh()
+        assert.are.equal(2, fetches)
+        assert.are.equal(2, #windows) -- refresh refills the same window
+
+        graphql.fetch_pr_checks = function(_, _, _, cb) cb("HTTP 500", nil) end
+        init._show_checks("org/repo", { number = 4, title = "U", head_oid = "h4" })
+        assert.are.equal("HTTP 500", windows[3].err)
+        package.loaded["gh-review.ui.pr_checks"] = nil
+      end)
+
+      it("_show_checks does not cache pending checks", function()
+        package.loaded["gh-review.ui.pr_checks"] = {
+          open = function() return { set = function() end, set_error = function() end } end,
+        }
+        local fetches = 0
+        graphql.fetch_pr_checks = function(_, _, _, cb)
+          fetches = fetches + 1
+          cb(nil, { head_oid = "h5", checks = { { name = "t", state = "PENDING", required = false } } })
+        end
+        init._show_checks("org/repo", { number = 5, title = "", head_oid = "h5" })
+        init._show_checks("org/repo", { number = 5, title = "", head_oid = "h5" })
+        assert.are.equal(2, fetches)
+        package.loaded["gh-review.ui.pr_checks"] = nil
+      end)
+    end)
+
+    describe("_merge_stack", function()
+      local gh_stack = require("gh-review.gh_stack")
+
+      it("refuses when a PR below is blocked", function()
+        local stack = parsed(raw_stack({ { 1, { isDraft = true } }, { 2 } }))
+        local called = false
+        gh.pr_merge_async = function() called = true end
+        init._merge_stack("o/r", stack, { methods = { "squash" }, merge_queue = false }, 2)
+        assert.is_false(called)
+        assert.is_truthy(has_note("cannot merge yet — #1: draft"))
+      end)
+
+      it("asks for the method, confirms, and merges the target with its sha", function()
+        local stack = parsed(raw_stack({ { 1, { state = "MERGED" } }, { 2 }, { 3 } }))
+        local prompts = {}
+        vim.ui.select = function(items, opts, cb)
+          table.insert(prompts, opts.prompt)
+          cb(items[1] == "Yes" and "Yes" or "rebase")
+        end
+        local req
+        gh.pr_merge_async = function(repo, n, o, cb)
+          req = { repo, n, o }
+          cb(nil, { status = "merged", details = {} })
+        end
+        init._merge_stack("o/r", stack, { methods = { "squash", "rebase" }, merge_queue = false }, 3)
+        assert.are.same({ "Merge method", "Merge #2, #3 into main (rebase)?" }, prompts)
+        assert.are.same({ "o/r", 3, { merge_method = "rebase", sha = "sha3" } }, req)
+        assert.is_truthy(has_note("merged #2, #3"))
+      end)
+
+      it("skips the method for merge queues", function()
+        local stack = parsed(raw_stack({ { 1 } }))
+        local prompts = {}
+        vim.ui.select = function(_, opts, cb) table.insert(prompts, opts.prompt); cb("Yes") end
+        local req
+        gh.pr_merge_async = function(_, _, o, cb) req = o; cb(nil, { status = "enqueued", details = {} }) end
+        init._merge_stack("o/r", stack, { methods = { "squash", "merge" }, merge_queue = true }, 1)
+        assert.are.same({ "Add #1 to the merge queue of main?" }, prompts)
+        assert.is_nil(req.merge_method)
+        assert.is_truthy(has_note("added #1 to the merge queue"))
+      end)
+
+      it("does nothing when the user declines", function()
+        local stack = parsed(raw_stack({ { 1 } }))
+        vim.ui.select = function(_, _, cb) cb("No") end
+        local called = false
+        gh.pr_merge_async = function() called = true end
+        init._merge_stack("o/r", stack, { methods = { "squash" }, merge_queue = false }, 1)
+        assert.is_false(called)
+      end)
+
+      it("reports request errors", function()
+        local stack = parsed(raw_stack({ { 1 } }))
+        vim.ui.select = function(_, _, cb) cb("Yes") end
+        gh.pr_merge_async = function(_, _, _, cb) cb("HTTP 409", nil) end
+        init._merge_stack("o/r", stack, { methods = {}, merge_queue = false }, 1)
+        assert.is_truthy(has_note("merge request failed: HTTP 409"))
+      end)
+    end)
+
+    describe("_handle_merge_result", function()
+      it("polls while pending, then reports the result", function()
+        vim.defer_fn = function(fn) fn() end
+        local polls = {}
+        local responses = {
+          { status = "pending", details = { uuid = "u1" } },
+          { status = "failed", details = { message = "checks failed" } },
+        }
+        gh.pr_merge_async_status = function(repo, n, uuid, cb)
+          table.insert(polls, { repo, n, uuid })
+          cb(nil, table.remove(responses, 1))
+        end
+        init._handle_merge_result("o/r", 3, { status = "pending", details = { uuid = "u1" } }, "#3", 0)
+        assert.are.same({ { "o/r", 3, "u1" }, { "o/r", 3, "u1" } }, polls)
+        assert.is_truthy(has_note("merging #3..."))
+        assert.is_truthy(has_note("merge of #3 failed: checks failed"))
+      end)
+
+      it("stops after the poll limit", function()
+        init._handle_merge_result("o/r", 3, { status = "pending", details = { uuid = "u" } }, "#3", init._merge_poll_limit)
+        assert.is_truthy(has_note("still pending"))
+      end)
+
+      it("reports poll errors and unknown statuses", function()
+        vim.defer_fn = function(fn) fn() end
+        gh.pr_merge_async_status = function(_, _, _, cb) cb("HTTP 500", nil) end
+        init._handle_merge_result("o/r", 3, { status = "pending", details = { uuid = "u" } }, "#3", 0)
+        assert.is_truthy(has_note("could not poll the merge of #3: HTTP 500"))
+        init._handle_merge_result("o/r", 3, nil, "#3", 0)
+        assert.is_truthy(has_note("unexpected merge status 'nil'"))
+      end)
+    end)
+
+    describe("_checkout_stack", function()
+      local gh_stack = require("gh-review.gh_stack")
+
+      it("checks out every open branch and reviews the top PR", function()
+        local stack = parsed(raw_stack({ { 1, { state = "MERGED" } }, { 2 }, { 3 } }))
+        local args
+        gh.checkout_stack = function(top, branches, cb) args = { top, branches }; cb(nil) end
+        local loaded
+        init._load_pr_data = function(n) loaded = n end
+        init._checkout_stack(stack)
+        assert.are.same({ 3, { "b2", "b3" } }, args)
+        assert.are.equal(3, loaded)
+      end)
+
+      it("reports a fully merged stack and checkout errors", function()
+        init._checkout_stack(parsed(raw_stack({ { 1, { state = "MERGED" } } })))
+        assert.is_truthy(has_note("every PR of stack #4 is merged or closed"))
+
+        gh.checkout_stack = function(_, _, cb) cb("fetch failed") end
+        init._checkout_stack(parsed(raw_stack({ { 1 } })))
+        assert.is_truthy(has_note("stack checkout failed: fetch failed"))
+      end)
     end)
   end)
 end)

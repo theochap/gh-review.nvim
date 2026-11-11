@@ -599,4 +599,108 @@ describe("graphql", function()
       assert.are.equal("not found", result_err)
     end)
   end)
+
+  describe("search_stacked_prs", function()
+    it("asks for stack metadata only, and drops unstacked PRs", function()
+      local sent
+      gh.graphql = function(query, vars, cb)
+        sent = { query = query, vars = vars }
+        cb(nil, { search = { nodes = {
+          { number = 1, stack = { number = 3, size = 2 } },
+          { number = 2, stack = vim.NIL },
+        } } })
+      end
+      local nodes
+      graphql.search_stacked_prs("o", "r", "author:@me", function(_, n) nodes = n end)
+      assert.are.equal("repo:o/r is:pr is:open author:@me", sent.vars.q)
+      assert.is_truthy(sent.query:find("baseRefOid", 1, true))
+      assert.is_nil(sent.query:find("statusCheckRollup", 1, true))
+      assert.is_nil(sent.query:find("mergeStateStatus", 1, true))
+      assert.are.equal(1, #nodes)
+    end)
+  end)
+
+  describe("_batches", function()
+    it("splits a list into chunks", function()
+      assert.are.same({ { 1, 2 }, { 3, 4 }, { 5 } }, graphql._batches({ 1, 2, 3, 4, 5 }, 2))
+      assert.are.same({}, graphql._batches({}, 2))
+    end)
+  end)
+
+  describe("fetch_pr_statuses", function()
+    it("fetches batches of aliased PRs and joins them by number", function()
+      graphql.STATUS_BATCH = 2
+      local queries = {}
+      gh.graphql = function(query, vars, cb)
+        table.insert(queries, query)
+        assert.are.same({ owner = "o", repo = "r" }, vars)
+        local repo = {}
+        for n in query:gmatch("p(%d+): pullRequest") do
+          repo["p" .. n] = { number = tonumber(n), mergeStateStatus = "CLEAN" }
+        end
+        cb(nil, { repository = repo })
+      end
+      local statuses
+      graphql.fetch_pr_statuses("o", "r", { 4, 7, 9 }, function(err, s)
+        assert.is_nil(err)
+        statuses = s
+      end)
+      assert.are.equal(2, #queries)
+      assert.is_truthy(queries[1]:find("statusCheckRollup { state }", 1, true))
+      assert.are.same({ 4, 7, 9 }, vim.tbl_map(function(n) return statuses[n].number end, { 4, 7, 9 }))
+    end)
+
+    it("reports the first error once and handles no PRs", function()
+      graphql.STATUS_BATCH = 1
+      local calls = 0
+      gh.graphql = function(_, _, cb) cb("HTTP 502", nil) end
+      graphql.fetch_pr_statuses("o", "r", { 1, 2 }, function(err)
+        calls = calls + 1
+        assert.are.equal("HTTP 502", err)
+      end)
+      assert.are.equal(1, calls)
+      local empty
+      graphql.fetch_pr_statuses("o", "r", {}, function(_, s) empty = s end)
+      assert.are.same({}, empty)
+    end)
+  end)
+
+  describe("fetch_pr_checks", function()
+    it("normalises check runs and status contexts", function()
+      local vars
+      gh.graphql = function(_, v, cb)
+        vars = v
+        cb(nil, { repository = { pullRequest = {
+          headRefOid = "h1",
+          statusCheckRollup = { contexts = { nodes = {
+            { __typename = "CheckRun", name = "test", status = "COMPLETED", conclusion = "FAILURE",
+              detailsUrl = "https://x/1", isRequired = true,
+              checkSuite = { workflowRun = { workflow = { name = "CI" } } } },
+            { __typename = "CheckRun", name = "lint", status = "IN_PROGRESS", conclusion = vim.NIL,
+              detailsUrl = "https://x/2", isRequired = false, checkSuite = { workflowRun = vim.NIL } },
+            { __typename = "StatusContext", context = "buildkite", state = "EXPECTED", targetUrl = vim.NIL, isRequired = false },
+          } } },
+        } } })
+      end
+      local result
+      graphql.fetch_pr_checks("o", "r", 5, function(err, r)
+        assert.is_nil(err)
+        result = r
+      end)
+      assert.are.same({ owner = "o", repo = "r", number = 5 }, vars)
+      assert.are.equal("h1", result.head_oid)
+      assert.are.same({
+        { name = "test", workflow = "CI", state = "FAILURE", url = "https://x/1", required = true },
+        { name = "lint", state = "PENDING", url = "https://x/2", required = false },
+        { name = "buildkite", state = "PENDING", required = false },
+      }, result.checks)
+    end)
+
+    it("handles a PR without checks", function()
+      gh.graphql = function(_, _, cb) cb(nil, { repository = { pullRequest = { headRefOid = "h", statusCheckRollup = vim.NIL } } }) end
+      local result
+      graphql.fetch_pr_checks("o", "r", 5, function(_, r) result = r end)
+      assert.are.same({}, result.checks)
+    end)
+  end)
 end)

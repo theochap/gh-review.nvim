@@ -20,6 +20,26 @@ describe("comment_input", function()
       vim.api.nvim_buf_delete(buf, { force = true })
     end)
 
+    it("shows no diagnostics, even when a linter reports some", function()
+      local win, buf = comment_input.open({
+        title = "Test",
+        on_submit = function() end,
+      })
+      assert.is_false(vim.diagnostic.is_enabled({ bufnr = buf }))
+      local ns = vim.api.nvim_create_namespace("test_markdownlint")
+      vim.diagnostic.set(ns, buf, { { lnum = 0, col = 0, message = "MD013 line length" } })
+      -- Nothing is drawn for it: apart from the header highlights, no mark
+      -- carries virtual text, a sign or a highlight.
+      local own = vim.api.nvim_create_namespace("gh_review_input_ctx")
+      local shown = vim.tbl_filter(function(m)
+        local d = m[4]
+        return d.ns_id ~= own and (d.virt_text ~= nil or d.sign_text ~= nil or d.hl_group ~= nil or d.virt_lines ~= nil)
+      end, vim.api.nvim_buf_get_extmarks(buf, -1, 0, -1, { details = true }))
+      assert.are.same({}, shown)
+      vim.api.nvim_win_close(win, true)
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
     it("sets markdown filetype", function()
       local win, buf = comment_input.open({
         title = "Test",
@@ -167,6 +187,105 @@ describe("comment_input", function()
       assert.is_truthy(text:find("Second comment body"))
       vim.api.nvim_win_close(win, true)
       vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+  end)
+
+  describe("suggestions", function()
+    local function close(win, buf)
+      if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+      if vim.api.nvim_buf_is_valid(buf) then vim.api.nvim_buf_delete(buf, { force = true }) end
+    end
+
+    it("starts on the given body, cursor on the given line", function()
+      local win, buf = comment_input.open({
+        title = "Suggest",
+        on_submit = function() end,
+        body_lines = { "```suggestion", "x = 1", "```" },
+        cursor_line = 2,
+      })
+      assert.are.same({ "```suggestion", "x = 1", "```" }, vim.api.nvim_buf_get_lines(buf, 1, -1, false))
+      assert.are.equal(3, vim.api.nvim_win_get_cursor(win)[1])
+      close(win, buf)
+    end)
+
+    it("inserts a suggestion block of the commented lines with the key", function()
+      local submitted
+      local win, buf = comment_input.open({
+        title = "New",
+        on_submit = function(body) submitted = body end,
+        suggestion_lines = { "x = 1" },
+      })
+      assert.is_truthy(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]:find("<C-g> suggestion", 1, true))
+      vim.api.nvim_buf_set_lines(buf, 1, -1, false, { "Use a constant:" })
+      vim.api.nvim_win_set_cursor(win, { 2, 0 })
+      vim.cmd("stopinsert")
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-g>", true, false, true), "x", false)
+      assert.are.equal(4, vim.api.nvim_win_get_cursor(win)[1])
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
+      assert.are.equal("Use a constant:\n```suggestion\nx = 1\n```", submitted)
+      close(win, buf)
+    end)
+
+    it("has no suggestion key without commented lines", function()
+      local win, buf = comment_input.open({ title = "Reply", on_submit = function() end })
+      assert.is_nil(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]:find("suggestion", 1, true))
+      assert.are.equal("", vim.fn.maparg("<C-g>", "n", false, true).lhs or "")
+      close(win, buf)
+    end)
+  end)
+
+  describe("cancel", function()
+    local orig_leader
+
+    before_each(function()
+      orig_leader = vim.g.mapleader
+      vim.g.mapleader = " "
+    end)
+
+    after_each(function()
+      vim.g.mapleader = orig_leader
+    end)
+
+    it("closes without submitting on <leader>wd, and names the key in the header", function()
+      local submitted, cancelled = false, false
+      local win, buf = comment_input.open({
+        title = "Reply",
+        on_submit = function() submitted = true end,
+        on_cancel = function() cancelled = true end,
+      })
+      assert.is_truthy(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]:find("<leader>wd cancel", 1, true))
+      vim.api.nvim_buf_set_lines(buf, 1, -1, false, { "draft" })
+      vim.cmd("stopinsert")
+      vim.api.nvim_feedkeys(" wd", "x", false)
+      assert.is_true(cancelled)
+      assert.is_false(submitted)
+      assert.is_false(vim.api.nvim_win_is_valid(win))
+      assert.is_false(vim.api.nvim_buf_is_valid(buf))
+    end)
+
+    it("leaves <Esc> alone", function()
+      local cancelled = false
+      local win, buf = comment_input.open({
+        title = "Reply",
+        on_submit = function() end,
+        on_cancel = function() cancelled = true end,
+      })
+      assert.are.equal("", vim.fn.maparg("<Esc>", "n"))
+      assert.are.equal("", vim.fn.maparg("<Esc>", "i"))
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc><Esc>", true, false, true), "x", false)
+      assert.is_false(cancelled)
+      assert.is_true(vim.api.nvim_win_is_valid(win))
+      vim.api.nvim_win_close(win, true)
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("takes another key from input_keys.cancel", function()
+      config.setup({ input_keys = { cancel = "q" } })
+      local cancelled = false
+      comment_input.open({ title = "R", on_submit = function() end, on_cancel = function() cancelled = true end })
+      vim.cmd("stopinsert")
+      vim.api.nvim_feedkeys("q", "x", false)
+      assert.is_true(cancelled)
     end)
   end)
 end)

@@ -5,7 +5,7 @@ local gh = require("gh-review.gh")
 local config = require("gh-review.config")
 
 describe("review_current", function()
-  local orig_pr_view_current
+  local orig_pr_view_current, orig_repo_name
   local notifications = {}
 
   before_each(function()
@@ -13,6 +13,9 @@ describe("review_current", function()
     state.clear()
     notifications = {}
     orig_pr_view_current = gh.pr_view_current
+    -- review_current resolves the repo early; keep the real gh out of it.
+    orig_repo_name = gh.repo_name
+    gh.repo_name = function(cb) cb(nil, "org/repo") end
 
     -- Capture vim.notify calls
     vim.notify = function(msg, level)
@@ -22,6 +25,7 @@ describe("review_current", function()
 
   after_each(function()
     gh.pr_view_current = orig_pr_view_current
+    gh.repo_name = orig_repo_name
     state.clear()
   end)
 

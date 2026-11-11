@@ -66,11 +66,23 @@ function M.run_sync(args, opts)
 end
 
 --- Check out a PR the jj way: fetch the head branch and put the working copy on
---- top of it. Used where `git` has no worktree to check anything out into — a
---- secondary jj workspace or a non-colocated jj repo.
+--- top of it. When jj already has the PR head, the fetch is skipped.
 ---@param pr_number number
 ---@param callback fun(err: string?)
-local function jj_checkout(pr_number, callback)
+---@param hint? GHReviewCheckoutHint
+local function jj_checkout(pr_number, callback, hint)
+  local function go(branch)
+    vcs.jj_checkout(branch, callback, nil, nil, {
+      head_oid = hint and hint.head_oid,
+      on_fetch = function()
+        vim.notify("GHReview: fetching " .. branch .. "...", vim.log.levels.INFO)
+      end,
+    })
+  end
+  if hint and hint.head_ref and hint.head_ref ~= "" then
+    go(hint.head_ref)
+    return
+  end
   M.run_json({ "pr", "view", tostring(pr_number), "--json", "headRefName" }, function(err, data)
     if err then
       callback(err)
@@ -81,25 +93,51 @@ local function jj_checkout(pr_number, callback)
       callback("could not determine PR head branch")
       return
     end
-    vcs.jj_checkout(branch, callback)
+    go(branch)
   end)
 end
 
 --- Checkout a PR branch.
 ---
---- In a jj workspace without a git worktree, `gh pr checkout` cannot run at all,
---- so the jj-native equivalent is used instead. In a colocated jj repository
---- `gh pr checkout` works, but is followed by `jj git import` so jj sees the new
---- branch and HEAD movement — otherwise the user's jj state would silently
---- diverge from git until they imported manually.
+--- In any jj workspace the jj-native way is used: fetch the head branch and
+--- `jj new` on it. A workspace without a git worktree cannot run
+--- `gh pr checkout` at all. One that is a git worktree (a colocated main
+--- workspace, or a secondary one made by jj ≥ 0.34) can, but `gh pr checkout`
+--- moves git HEAD behind jj's back, and fails when the branch is checked out
+--- in another worktree. It remains the fallback there for what jj cannot
+--- fetch, such as a PR from a fork; `jj git import` then syncs jj.
 ---@param pr_number number
 ---@param callback fun(err: string?)
-function M.checkout(pr_number, callback)
-  if vcs.context().kind == "jj" then
-    jj_checkout(pr_number, callback)
+---@param hint? GHReviewCheckoutHint What the caller knows of the PR already
+function M.checkout(pr_number, callback, hint)
+  local ctx = vcs.context()
+  if ctx.kind == "jj" then
+    jj_checkout(pr_number, callback, hint)
     return
   end
+  if ctx.jj_root then
+    jj_checkout(pr_number, function(err)
+      if not err then
+        callback(nil)
+        return
+      end
+      vim.notify("GHReview: jj checkout failed (" .. vim.trim(err) .. "), trying gh pr checkout", vim.log.levels.WARN)
+      M._gh_pr_checkout(pr_number, callback)
+    end, hint)
+    return
+  end
+  M._gh_pr_checkout(pr_number, callback)
+end
 
+---@class GHReviewCheckoutHint
+---@field head_oid? string PR head commit
+---@field base_oid? string PR base commit
+---@field head_ref? string PR head branch
+
+--- `gh pr checkout`, then `jj git import` in a colocated jj repo.
+---@param pr_number number
+---@param callback fun(err: string?)
+function M._gh_pr_checkout(pr_number, callback)
   M.run({ "pr", "checkout", tostring(pr_number) }, function(err, _)
     if err then
       callback(err)
@@ -126,7 +164,7 @@ end
 
 --- Fields requested for PR metadata. `headRefOid` is the commit that inline
 --- comments must be anchored to when posting them through the REST API.
-local PR_VIEW_FIELDS = "number,title,author,baseRefName,headRefName,headRefOid,url,reviewDecision,body"
+local PR_VIEW_FIELDS = "number,title,author,baseRefName,baseRefOid,headRefName,headRefOid,url,reviewDecision,body"
 
 --- Get PR metadata as JSON
 ---@param pr_number number
@@ -164,6 +202,8 @@ function M.pr_files(pr_number, callback)
           additions = f.additions or 0,
           deletions = f.deletions or 0,
           previousFilename = f.previous_filename,
+          -- Hunks of this file; GitHub leaves it out for very large diffs.
+          patch = type(f.patch) == "string" and f.patch or nil,
         })
       end
       callback(nil, files)
@@ -318,29 +358,288 @@ function M.pr_add_review_comment(pr_number, opts, callback)
   end)
 end
 
---- List open PRs for the current repo
----@param callback fun(err: string?, prs: table?)
-function M.pr_list(callback)
-  local fields = "number,title,author,body,state,headRefName,isDraft,createdAt,reviewDecision"
-  M.run_json({
+--- `gh pr list` arguments for the open PRs matching `search`.
+---@param fields string
+---@param search? string
+---@return string[]
+local function pr_list_args(fields, search)
+  local args = {
     "pr", "list",
     "--json", fields,
     "--limit", "50",
+  }
+  if search and search ~= "" then
+    vim.list_extend(args, { "--search", search })
+  end
+  return args
+end
+
+--- List open PRs for the current repo. `reviewDecision` is left out: it costs
+--- GitHub more than every other field together (~2 s for 50 PRs), so the
+--- picker loads it afterwards with `pr_review_states`.
+---@param callback fun(err: string?, prs: table?)
+---@param search? string GitHub search qualifiers, e.g. "author:@me"
+function M.pr_list(callback, search)
+  local fields = "number,title,author,body,state,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,createdAt"
+  M.run_json(pr_list_args(fields, search), callback)
+end
+
+---@class GHReviewReviewState
+---@field decision? string Overall review decision (APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED)
+---@field viewer? string State of your own latest review (APPROVED, CHANGES_REQUESTED, COMMENTED, ...)
+
+--- Review decision and your own latest review of the open PRs matching
+--- `search`, newest 50 (the same PRs `pr_list` returns).
+---@param callback fun(err: string?, states: table<number, GHReviewReviewState>?) By PR number
+---@param search? string
+function M.pr_review_states(callback, search)
+  M.repo_name(function(repo_err, repo)
+    if repo_err then
+      callback(repo_err, nil)
+      return
+    end
+    local query = [[
+      query($q: String!) {
+        search(query: $q, type: ISSUE, first: 50) {
+          nodes {
+            ... on PullRequest {
+              number
+              reviewDecision
+              viewerLatestReview { state }
+            }
+          }
+        }
+      }
+    ]]
+    local q = vim.trim(string.format("repo:%s is:pr is:open sort:created-desc %s", repo, search or ""))
+    M.graphql(query, { q = q }, function(err, data)
+      if err then
+        callback(err, nil)
+        return
+      end
+      local states = {}
+      for _, node in ipairs(data.search and data.search.nodes or {}) do
+        if node.number then
+          local review = type(node.viewerLatestReview) == "table" and node.viewerLatestReview or {}
+          states[node.number] = {
+            decision = type(node.reviewDecision) == "string" and node.reviewDecision or nil,
+            viewer = type(review.state) == "string" and review.state or nil,
+          }
+        end
+      end
+      callback(nil, states)
+    end)
+  end)
+end
+
+--- Native stacks of the open PRs matching `search`, newest 50 (the same PRs
+--- `pr_list` returns): the raw `stack` of each stacked PR, by PR number. It
+--- asks for the PR number, state and author of each entry only, so it stays
+--- cheap enough to run for every PR list. Kept apart from `pr_review_states`,
+--- because a host without native stacks fails the whole query.
+---@param callback fun(err: string?, stacks: table<number, table>?) Raw PullRequestStack by PR number
+---@param search? string
+function M.pr_stacks(callback, search)
+  M.repo_name(function(repo_err, repo)
+    if repo_err then
+      callback(repo_err, nil)
+      return
+    end
+    local query = [[
+      query($q: String!) {
+        search(query: $q, type: ISSUE, first: 50) {
+          nodes {
+            ... on PullRequest {
+              number
+              stack {
+                number
+                size
+                baseRefName
+                entries(first: 100) {
+                  nodes { position pullRequest { number state author { login } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]]
+    local q = vim.trim(string.format("repo:%s is:pr is:open sort:created-desc %s", repo, search or ""))
+    M.graphql(query, { q = q }, function(err, data)
+      if err then
+        callback(err, nil)
+        return
+      end
+      local stacks = {}
+      for _, node in ipairs(data.search and data.search.nodes or {}) do
+        if node.number and type(node.stack) == "table" then stacks[node.number] = node.stack end
+      end
+      callback(nil, stacks)
+    end)
+  end)
+end
+
+--- Open PRs by head branch, all in one GraphQL query: each branch is an
+--- aliased `pullRequests(headRefName:)` field. Branches without an open PR
+--- are absent from the result.
+---@param branches string[]
+---@param callback fun(err: string?, numbers: table<string, number>?) PR number by branch
+function M.prs_by_head(branches, callback)
+  if #branches == 0 then
+    callback(nil, {})
+    return
+  end
+  M.repo_name(function(repo_err, repo)
+    local owner, name = (repo or ""):match("^(.+)/(.+)$")
+    if repo_err or not owner then
+      callback(repo_err or "invalid repo " .. tostring(repo), nil)
+      return
+    end
+    local decls, fields = { "$owner: String!", "$name: String!" }, {}
+    local vars = { owner = owner, name = name }
+    for i, branch in ipairs(branches) do
+      table.insert(decls, "$h" .. i .. ": String!")
+      table.insert(fields, ("b%d: pullRequests(headRefName: $h%d, states: OPEN, first: 1) { nodes { number } }"):format(i, i))
+      vars["h" .. i] = branch
+    end
+    local query = "query(" .. table.concat(decls, ", ") .. ") { repository(owner: $owner, name: $name) { "
+      .. table.concat(fields, " ") .. " } }"
+    M.graphql(query, vars, function(err, data)
+      if err then
+        callback(err, nil)
+        return
+      end
+      local repo_data = data and data.repository or {}
+      local numbers = {}
+      for i, branch in ipairs(branches) do
+        local conn = repo_data["b" .. i]
+        local node = type(conn) == "table" and conn.nodes and conn.nodes[1]
+        if type(node) == "table" and node.number then numbers[branch] = node.number end
+      end
+      callback(nil, numbers)
+    end)
+  end)
+end
+
+---@type string?
+local viewer_login
+
+--- Login of the authenticated user. Remembered after the first answer.
+---@param callback fun(err: string?, login: string?)
+function M.viewer_login(callback)
+  if viewer_login then
+    callback(nil, viewer_login)
+    return
+  end
+  M.graphql("query { viewer { login } }", {}, function(err, data)
+    local login = not err and data and data.viewer and data.viewer.login or nil
+    if type(login) ~= "string" or login == "" then
+      callback(err or "no viewer login", nil)
+      return
+    end
+    viewer_login = login
+    callback(nil, login)
+  end)
+end
+
+--- Forget the remembered viewer login (tests, account switches).
+function M.forget_viewer_login()
+  viewer_login = nil
+end
+
+--- REST API version that has the async merge endpoint.
+local MERGE_ASYNC_API_VERSION = "X-GitHub-Api-Version: 2026-03-10"
+
+--- Start an async merge of a PR. For a stacked PR this merges (or enqueues)
+--- every open PR below it too, in one atomic operation.
+---@param repo string owner/name
+---@param pr_number number
+---@param opts { merge_method?: string, sha?: string }
+---@param callback fun(err: string?, result: { status: string, details: table }?)
+function M.pr_merge_async(repo, pr_number, opts, callback)
+  local args = {
+    "api", "--method", "PUT", "-H", MERGE_ASYNC_API_VERSION,
+    "repos/" .. repo .. "/pulls/" .. tostring(pr_number) .. "/merge-async",
+  }
+  if opts.merge_method then
+    vim.list_extend(args, { "-f", "merge_method=" .. opts.merge_method })
+  end
+  if opts.sha then
+    vim.list_extend(args, { "-f", "sha=" .. opts.sha })
+  end
+  M.run_json(args, callback)
+end
+
+--- Poll the result of an async merge started with `pr_merge_async`.
+---@param repo string owner/name
+---@param pr_number number
+---@param uuid string
+---@param callback fun(err: string?, result: { status: string, details: table }?)
+function M.pr_merge_async_status(repo, pr_number, uuid, callback)
+  M.run_json({
+    "api", "-H", MERGE_ASYNC_API_VERSION,
+    "repos/" .. repo .. "/pulls/" .. tostring(pr_number) .. "/merge-async/" .. uuid,
   }, callback)
 end
 
---- Get repository owner/name
+--- Checkout a whole native stack. Under jj, every open branch of the stack is
+--- fetched so the stack navigation finds a bookmark for each PR, and the working
+--- copy goes on top of the topmost one. Under git, the topmost PR is checked out:
+--- its branch holds every PR below it.
+---@param top_number number Topmost open PR
+---@param branches string[] Head branches of the open PRs, bottom first
+---@param callback fun(err: string?)
+---@param head_oid? string Head commit of the topmost PR; skips the fetch when jj has it
+function M.checkout_stack(top_number, branches, callback, head_oid)
+  if vcs.jj_root(vim.fn.getcwd()) and #branches > 0 then
+    vcs.jj_checkout(branches[#branches], callback, nil, branches, {
+      head_oid = head_oid,
+      on_fetch = function()
+        vim.notify("GHReview: fetching " .. #branches .. " stack branches...", vim.log.levels.INFO)
+      end,
+    })
+    return
+  end
+  M.checkout(top_number, callback, { head_oid = head_oid })
+end
+
+---@type table<string, string>
+local repo_names = {}
+---@type table<string, fun(err: string?, repo: string?)[]>
+local repo_waiters = {}
+
+--- Get repository owner/name. The answer is remembered per directory (and
+--- GH_REPO): `gh repo view` costs ~0.5 s and every PR load needs it first.
+--- Calls back at once on a hit; calls made while a lookup runs share it.
 ---@param callback fun(err: string?, repo: string?)
 function M.repo_name(callback)
+  local ctx = vcs.gh_context()
+  local key = (ctx.cwd or vim.fn.getcwd()) .. "|" .. (ctx.env and ctx.env.GH_REPO or "")
+  if repo_names[key] then
+    callback(nil, repo_names[key])
+    return
+  end
+  if repo_waiters[key] then
+    table.insert(repo_waiters[key], callback)
+    return
+  end
+  repo_waiters[key] = { callback }
   M.run({
     "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner",
   }, function(err, output)
-    if err then
-      callback(err, nil)
-      return
+    local name = not err and vim.trim(output or "") or nil
+    if name and name ~= "" then repo_names[key] = name end
+    local waiters = repo_waiters[key] or {}
+    repo_waiters[key] = nil
+    for _, cb in ipairs(waiters) do
+      if err then cb(err, nil) else cb(nil, name) end
     end
-    callback(nil, vim.trim(output or ""))
   end)
+end
+
+--- Forget remembered repository names (e.g. after the cwd changes).
+function M.forget_repo_names()
+  repo_names = {}
 end
 
 --- Run a GraphQL query

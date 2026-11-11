@@ -68,15 +68,98 @@ function M.setup(user_config)
   -- directory; drop it when the cwd changes so a new repo is re-detected.
   vim.api.nvim_create_autocmd("DirChanged", {
     group = vim.api.nvim_create_augroup("GHReviewVcs", { clear = true }),
-    callback = function() vcs.invalidate() end,
+    callback = function()
+      vcs.invalidate()
+      gh.forget_repo_names()
+      M._detected = nil
+      M._sync_gh_repo_env()
+    end,
+  })
+
+  -- Keep the file tree sidebar pointed at the file you are looking at. The
+  -- plugin's own navigation syncs it from `_open_file`, but a file can also be
+  -- reached by `:e`, `<C-o>`, `:bnext`, another picker or a window jump, and the
+  -- sidebar was left behind on the previously opened file in all of those.
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+    group = vim.api.nvim_create_augroup("GHReviewFileSync", { clear = true }),
+    callback = function(args)
+      if not state.is_active() then return end
+      require("gh-review.ui.files").sync_current(args.buf)
+    end,
   })
 
   -- Auto-detect PR for current branch after startup
   M._schedule_pr_detection()
+
+  M._sync_gh_repo_env()
+
+  -- Drop cache entries nobody read for a month, off the startup path.
+  vim.defer_fn(function() pcall(require("gh-review.cache").prune) end, 5000)
+end
+
+--- $GH_REPO value this plugin set, so it can take it back.
+---@type string?
+M._exported_gh_repo = nil
+
+--- In a jj workspace with no git worktree (a secondary `jj workspace add`,
+--- or a non-colocated repo), `gh` cannot tell which repository it is in and
+--- fails with "not a git repository". This plugin works around that for its
+--- own calls; exporting $GH_REPO extends the fix to every child process —
+--- snacks.nvim's `gh` pickers, terminals, other plugins. A $GH_REPO the user
+--- set is never touched, and the exported one is removed on leaving.
+function M._sync_gh_repo_env()
+  if M._exported_gh_repo and vim.env.GH_REPO == M._exported_gh_repo then
+    vim.env.GH_REPO = nil
+  end
+  M._exported_gh_repo = nil
+  if not config.get().export_gh_repo then return end
+  if vim.env.GH_REPO and vim.env.GH_REPO ~= "" then return end
+  local ctx = vcs.context()
+  if ctx.kind ~= "jj" then return end -- a git worktree: gh resolves the repo itself
+
+  local cwd = vim.fn.getcwd()
+  local function export(name)
+    -- Drop a late answer for a directory we already left.
+    if not name or name == "" or vim.fn.getcwd() ~= cwd then return end
+    if vim.env.GH_REPO and vim.env.GH_REPO ~= "" then return end
+    vim.env.GH_REPO = name
+    M._exported_gh_repo = name
+  end
+  if ctx.gh_env and ctx.gh_env.GH_REPO then
+    export(ctx.gh_env.GH_REPO)
+    return
+  end
+  -- Colocated main workspace next to this one: ask gh there (it honours
+  -- `gh repo set-default` and forks).
+  gh.repo_name(function(err, name)
+    if not err then export(name) end
+  end)
+end
+
+--- Delete the commit-keyed cache (PR content, merge statuses, checks).
+function M.clear_cache()
+  require("gh-review.cache").clear()
+  vim.notify("GHReview: cache cleared", vim.log.levels.INFO)
 end
 
 --- Check if the current branch has an open PR and notify the user
 M._pr_detection_notified = false
+
+--- Metadata of the PR found for the working copy (by startup detection or the
+--- last `review_current`), and the commit the working copy was on. It is used
+--- right away by the next `review_current` on that commit, and checked
+--- against GitHub in the background.
+---@type { data: table, head: string? }?
+M._detected = nil
+
+---@param data table `gh.pr_view` output
+---@return { head_oid?: string, base_oid?: string }
+local function hint_of(data)
+  return {
+    head_oid = type(data.headRefOid) == "string" and data.headRefOid or nil,
+    base_oid = type(data.baseRefOid) == "string" and data.baseRefOid or nil,
+  }
+end
 
 function M._schedule_pr_detection()
   local function check()
@@ -85,6 +168,10 @@ function M._schedule_pr_detection()
       if err or not data then return end
       if M._pr_detection_notified or state.is_active() then return end
       M._pr_detection_notified = true
+      -- Keep the metadata for review_current, and warm the repo name: the
+      -- review this notification suggests needs both first.
+      M._detected = { data = data, head = vcs.base_commit() }
+      gh.repo_name(function() end)
       local km = config.get().keymaps
       vim.notify(
         string.format("GHReview: PR #%d found — %s (use %s%s to review)", data.number, data.title, km.prefix, km.review_current),
@@ -107,7 +194,8 @@ end
 
 --- Checkout a PR and load all review data
 ---@param pr_number number
-function M.checkout(pr_number)
+---@param hint? { head_oid?: string, base_oid?: string } Commits of the PR, when known
+function M.checkout(pr_number, hint)
   vim.notify("GHReview: checking out PR #" .. pr_number .. "...", vim.log.levels.INFO)
 
   gh.checkout(pr_number, function(err)
@@ -117,156 +205,287 @@ function M.checkout(pr_number)
     end
 
     vim.notify("GHReview: checked out PR #" .. pr_number, vim.log.levels.INFO)
-    M._load_pr_data(pr_number)
-  end)
+    M._load_pr_data(pr_number, function() M._after_review_load() end, hint)
+  end, hint)
 end
 
---- Load PR metadata, files, diff, and threads
+--- PR number the open views were last built for.
+---@type number?
+M._loaded_pr_number = nil
+
+--- Rebuild the sidebars that are open from freshly loaded data, so a checkout
+--- of another PR (or a reload) does not leave them listing the old files.
+--- Closed sidebars stay closed. When the PR itself changed, the diff split and
+--- the unified view show a file of the previous PR, so they are closed.
+---@param pr_changed boolean
+function M._reload_open_views(pr_changed)
+  if pr_changed then
+    require("gh-review.ui.diff_review").close()
+    require("gh-review.ui.unified").close()
+  end
+  local files = require("gh-review.ui.files")
+  local commits = require("gh-review.ui.commits")
+  local files_open = files.is_open and files.is_open()
+  local commits_open = commits.is_open and commits.is_open()
+  if not (files_open or commits_open) then return end
+  if files_open then close_snacks_picker("gh_review_files") end
+  if commits_open then close_snacks_picker("gh_review_commits") end
+  -- Same short delay as _refresh_views: let snacks finish closing first.
+  -- Reopened without focus: the cursor stays where you are, or on the file
+  -- a load opens (`open_first_file`).
+  vim.defer_fn(function()
+    if files_open then files.show({ focus = false }) end
+    if commits_open then commits.show({ focus = false }) end
+  end, 50)
+end
+
+--- Join step of `_load_pr_data`: map threads onto the diff and refresh views.
+---@param errors string[]
+---@param callback? fun()
+function M._finish_load(errors, callback)
+  if #errors > 0 then
+    vim.notify("GHReview: errors loading PR data:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
+    return
+  end
+
+  -- Map thread line numbers using diff data
+  local diff_files = diff.parse(state.get_diff_text())
+  local threads = diff.map_threads(state.get_threads(), diff_files)
+  state.set_threads(threads)
+
+  -- Refresh diagnostics
+  diagnostics.refresh_all()
+
+  -- Refresh trouble if open
+  pcall(function()
+    local trouble = require("trouble")
+    if trouble.is_open("gh_review") then
+      trouble.refresh("gh_review")
+    end
+  end)
+
+  local pr = state.get_pr()
+  local number = pr and pr.number or nil
+  M._reload_open_views(number ~= M._loaded_pr_number)
+  M._loaded_pr_number = number
+
+  local source = state.get_content_source()
+  vim.notify(
+    "GHReview: loaded " .. #state.get_files() .. " files, " .. #state.get_threads() .. " threads"
+      .. (source and source ~= "network" and (" (diff from " .. source .. ")") or ""),
+    vim.log.levels.INFO
+  )
+
+  if callback then callback() end
+end
+
+--- Load PR metadata, files, diff, and threads.
+---
+--- Files, diff and commits come from `pr_content` (cache, local repository, or
+--- GitHub). They need the PR's head and base oids: when the caller already has
+--- them (`hint`, e.g. from a picker), that load starts at once; otherwise it
+--- starts as soon as the metadata names them.
 ---@param pr_number number
 ---@param callback? fun()
-function M._load_pr_data(pr_number, callback)
-  -- 5 parallel operations: metadata chain, files, diff, comments, commits
-  local pending = 5
+---@param hint? { head_oid?: string, base_oid?: string }
+---@param meta? table `gh.pr_view` output the caller already has; skips that call
+function M._load_pr_data(pr_number, callback, hint, meta)
+  -- 3 parallel operations: metadata + threads, content (files+diff+commits), comments
+  local pending = 3
   local errors = {}
+  local content_started = false
+  -- Merge base the local jj diff starts from; the base side of the views
+  -- must use it instead of the one `set_pr` computes.
+  local content_base
 
   local function done()
     pending = pending - 1
     if pending > 0 then return end
-
-    if #errors > 0 then
-      vim.notify("GHReview: errors loading PR data:\n" .. table.concat(errors, "\n"), vim.log.levels.ERROR)
-      return
-    end
-
-    -- Map thread line numbers using diff data
-    local diff_files = diff.parse(state.get_diff_text())
-    local threads = diff.map_threads(state.get_threads(), diff_files)
-    state.set_threads(threads)
-
-    -- Refresh diagnostics
-    diagnostics.refresh_all()
-
-    -- Refresh trouble if open
-    pcall(function()
-      local trouble = require("trouble")
-      if trouble.is_open("gh_review") then
-        trouble.refresh("gh_review")
-      end
-    end)
-
-    vim.notify("GHReview: loaded " .. #state.get_files() .. " files, " .. #state.get_threads() .. " threads", vim.log.levels.INFO)
-
-    if callback then callback() end
+    M._finish_load(errors, callback)
   end
 
-  -- PR metadata chain: pr_view → repo_name → fetch_threads
-  -- Counted as ONE pending item — done() is called exactly once at the end
-  gh.pr_view(pr_number, function(err, data)
-    if err then
-      table.insert(errors, "metadata: " .. err)
-      done()
-      return
-    end
-    if not data then
-      table.insert(errors, "metadata: empty response")
-      done()
-      return
-    end
+  ---@param content GHReviewPRContent
+  local function apply_content(content)
+    state.set_files(content.files or {})
+    state.set_diff_text(content.diff_text or "")
+    state.set_commits(content.commits or {})
+    state.set_content_source(content.source)
+  end
 
-    gh.repo_name(function(repo_err, repo)
-      if repo_err then
-        table.insert(errors, "repo: " .. repo_err)
-        done()
+  local function load_remote_content(ref)
+    require("gh-review.pr_content").load(ref, function(content_errors, content)
+      if content_errors then
+        vim.list_extend(errors, content_errors)
+      elseif content then
+        apply_content(content)
+      end
+      done()
+    end)
+  end
+
+  --- The local jj version of the PR (`toggle_local_diff`), or GitHub's when
+  --- there is none: the PR is not in this repository, or this is not jj.
+  local function load_local_content(ref, refs)
+    require("gh-review.pr_content").load_jj({
+      head_ref = refs.head_ref,
+      head_oid = ref.head_oid,
+      base_ref = refs.base_ref,
+      base_oid = ref.base_oid,
+    }, function(err, content)
+      if err or not content then
+        vim.notify("GHReview: no local jj diff (" .. (err or "unknown") .. "), showing GitHub's", vim.log.levels.WARN)
+        state.set_local_diff(false)
+        load_remote_content(ref)
         return
       end
+      apply_content(content)
+      content_base = content.base_sha
+      local pr = state.get_pr()
+      if pr and pr.number == pr_number and content_base then pr.base_sha = content_base end
+      done()
+    end)
+  end
 
-      state.set_pr({
-        number = data.number,
-        title = data.title,
-        author = data.author and data.author.login or "unknown",
-        base_ref = data.baseRefName,
-        base_sha = util.git_merge_base(data.baseRefName, vim.fn.getcwd()),
-        head_ref = data.headRefName,
-        head_sha = type(data.headRefOid) == "string" and data.headRefOid or nil,
-        url = data.url,
-        body = data.body or "",
-        review_decision = data.reviewDecision or "",
-        repository = repo,
-      })
+  ---@param refs? { head_ref?: string, base_ref?: string } Branches, from the metadata
+  local function load_content(head_oid, base_oid, repo, refs)
+    if content_started then return end
+    content_started = true
+    local ref = {
+      repo = repo ~= "" and repo or nil,
+      number = pr_number,
+      head_oid = head_oid,
+      base_oid = base_oid,
+    }
+    if state.get_local_diff() and vcs.jj_root() then
+      load_local_content(ref, refs or {})
+    else
+      load_remote_content(ref)
+    end
+  end
 
-      -- Seed view mode from config only on first PR load of the session
-      -- so a user's toggle choice persists across refreshes.
-      if not state.get_view_mode() then
-        state.set_view_mode(config.get().default_view_mode or "split")
-      end
+  -- The local diff needs the branch names, which only the metadata has.
+  local early_content = not state.get_local_diff() and hint and hint.head_oid and hint.base_oid
 
-      -- Apply default ignore-whitespace preference. Done inside the PR-id
-      -- branch (rather than at plugin setup) so it only takes effect while a
-      -- review is active; M.close reliably unwinds it.
-      if config.get().default_ignore_whitespace and not util.ignore_whitespace_active() then
-        util.enable_ignore_whitespace()
-      end
+  --- Nothing will name the commits (metadata or repo failed): the content
+  --- load will not run, so count it as finished.
+  local function skip_content()
+    if content_started then return end
+    content_started = true
+    done()
+  end
 
-      local owner, repo_name = repo:match("^(.+)/(.+)$")
-      if not owner or not repo_name then
-        table.insert(errors, "invalid repo format: " .. (repo or "nil"))
-        done()
-        return
-      end
+  -- Metadata and threads, counted as ONE pending item made of two parts:
+  -- "pr" (set_pr, needs metadata and repo) and "threads" (needs repo only).
+  -- `gh.repo_name` is memoized, so threads, the PR id and (with a hint) the
+  -- content start at once, side by side with `pr_view` — or without it, when
+  -- the caller already has the metadata (`meta`).
+  local meta_data = meta
+  local repo_value, node_id
+  local parts_left = 2
+  local finished = {}
+  local function finish(part)
+    if finished[part] then return end
+    finished[part] = true
+    parts_left = parts_left - 1
+    if parts_left == 0 then done() end
+  end
 
-      -- Fetch PR node ID for mutations (fire and forget)
+  local function apply_metadata()
+    if not (meta_data and repo_value) then return end
+    local data = meta_data
+    load_content(
+      type(data.headRefOid) == "string" and data.headRefOid or nil,
+      type(data.baseRefOid) == "string" and data.baseRefOid or nil,
+      repo_value,
+      { head_ref = data.headRefName, base_ref = data.baseRefName }
+    )
+
+    state.set_pr({
+      number = data.number,
+      title = data.title,
+      author = data.author and data.author.login or "unknown",
+      base_ref = data.baseRefName,
+      base_sha = content_base or util.git_merge_base(data.baseRefName, vim.fn.getcwd()),
+      head_ref = data.headRefName,
+      head_sha = type(data.headRefOid) == "string" and data.headRefOid or nil,
+      url = data.url,
+      body = data.body or "",
+      review_decision = data.reviewDecision or "",
+      repository = repo_value,
+      node_id = node_id,
+    })
+
+    -- Seed view mode from config only on first PR load of the session
+    -- so a user's toggle choice persists across refreshes.
+    if not state.get_view_mode() then
+      state.set_view_mode(config.get().default_view_mode or "split")
+    end
+
+    -- Apply default ignore-whitespace preference. Done here (rather than at
+    -- plugin setup) so it only takes effect while a review is active;
+    -- M.close reliably unwinds it.
+    if config.get().default_ignore_whitespace and not util.ignore_whitespace_active() then
+      util.enable_ignore_whitespace()
+    end
+    finish("pr")
+  end
+
+  gh.repo_name(function(repo_err, repo)
+    if repo_err then
+      table.insert(errors, "repo: " .. repo_err)
+      finish("pr")
+      finish("threads")
+      skip_content()
+      return
+    end
+    repo_value = repo
+
+    if early_content then
+      load_content(hint.head_oid, hint.base_oid, repo)
+    end
+
+    local owner, repo_name = repo:match("^(.+)/(.+)$")
+    if not owner or not repo_name then
+      table.insert(errors, "invalid repo format: " .. (repo or "nil"))
+      finish("threads")
+    else
+      -- PR node ID for mutations (fire and forget). It may land before the
+      -- metadata; set_pr picks it up then.
       graphql.fetch_pr_id(owner, repo_name, pr_number, function(id_err, pr_id)
         if id_err then
           table.insert(errors, "pr_id: " .. id_err)
-        else
-          local pr = state.get_pr()
-          if pr then
-            pr.node_id = pr_id
-          end
+          return
         end
+        node_id = pr_id
+        local pr = state.get_pr()
+        if pr and pr.number == pr_number then pr.node_id = pr_id end
       end)
 
-      -- Fetch threads — this is the terminal done() for the chain
       graphql.fetch_threads(owner, repo_name, pr_number, function(t_err, threads)
         if t_err then
           table.insert(errors, "threads: " .. t_err)
         else
           state.set_threads(threads or {})
         end
-        done()
+        finish("threads")
       end)
-    end)
+    end
+
+    apply_metadata()
   end)
 
-  -- PR files
-  gh.pr_files(pr_number, function(err, files)
-    if err then
-      table.insert(errors, "files: " .. err)
-    else
-      local parsed = {}
-      for _, f in ipairs(files or {}) do
-        table.insert(parsed, {
-          path = f.path,
-          status = (f.status or "modified"):lower(),
-          additions = f.additions or 0,
-          deletions = f.deletions or 0,
-          old_path = f.previousFilename,
-        })
+  if not meta_data then
+    gh.pr_view(pr_number, function(err, data)
+      if err or not data then
+        table.insert(errors, "metadata: " .. (err or "empty response"))
+        finish("pr")
+        if not early_content then skip_content() end
+        return
       end
-      state.set_files(parsed)
-    end
-    done()
-  end)
-
-  -- PR diff
-  gh.pr_diff(pr_number, function(err, diff_text)
-    if err then
-      table.insert(errors, "diff: " .. err)
-    else
-      state.set_diff_text(diff_text or "")
-    end
-    done()
-  end)
+      meta_data = data
+      apply_metadata()
+    end)
+  end
 
   -- Top-level PR comments
   gh.pr_comments(pr_number, function(err, comments)
@@ -286,30 +505,6 @@ function M._load_pr_data(pr_number, callback)
     end
     done()
   end)
-
-  -- PR commits
-  gh.pr_commits(pr_number, function(err, commits)
-    if err then
-      table.insert(errors, "commits: " .. err)
-    else
-      local parsed = {}
-      for _, c in ipairs(commits or {}) do
-        local commit = c.commit or c
-        local full_oid = c.oid or commit.oid or ""
-        table.insert(parsed, {
-          sha = full_oid:sub(1, 7),
-          oid = full_oid,
-          message = (commit.messageHeadline or commit.message or ""):match("^([^\n]+)") or "",
-          author = commit.authors and commit.authors[1] and commit.authors[1].login
-            or commit.author and commit.author.login
-            or "unknown",
-          date = commit.committedDate or commit.authoredDate or "",
-        })
-      end
-      state.set_commits(parsed)
-    end
-    done()
-  end)
 end
 
 --- Refresh current PR data
@@ -323,6 +518,30 @@ function M.refresh(callback)
 
   vim.notify("GHReview: refreshing...", vim.log.levels.INFO)
   M._load_pr_data(pr.number, callback)
+end
+
+--- Switch the review between the PR as it is on GitHub and its local jj
+--- version: the head branch as it is in this repository, plus unpushed commits
+--- and working-copy edits on top of it, up to the last non-empty commit. The
+--- threads stay those of GitHub. The choice holds across refreshes until the
+--- review closes.
+function M.toggle_local_diff()
+  if not require_active() then return end
+  local on = not state.get_local_diff()
+  if on and not vcs.jj_root() then
+    vim.notify("GHReview: the local diff requires a jj workspace", vim.log.levels.WARN)
+    return
+  end
+  local pr = state.get_pr()
+  state.set_local_diff(on)
+  -- Commit oids differ between the two versions: a commit filter of one does
+  -- not exist in the other.
+  state.clear_active_commit()
+  vim.notify(
+    "GHReview: " .. (on and "loading the local jj diff" or "loading the GitHub diff") .. " of PR #" .. pr.number .. "...",
+    vim.log.levels.INFO
+  )
+  M._load_pr_data(pr.number, function() M._refresh_views() end)
 end
 
 --- Open a PR file in whatever view mode is currently active.
@@ -358,6 +577,47 @@ function M._open_file(path, line)
   require("gh-review.ui.files").sync_selection(path)
 end
 
+--- A window to open a file in: the current one, unless it is floating or a
+--- picker (the files sidebar, an explorer), then the first normal window of
+--- the tab. A start screen such as the snacks dashboard is fine: the file
+--- replaces it.
+---@return number? win
+local function file_window()
+  local function usable(win)
+    if vim.api.nvim_win_get_config(win).relative ~= "" then return false end
+    local ft = vim.bo[vim.api.nvim_win_get_buf(win)].filetype
+    return not ft:match("^snacks_picker")
+  end
+  local current = vim.api.nvim_get_current_win()
+  if usable(current) then return current end
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if usable(win) then return win end
+  end
+  return nil
+end
+
+--- What follows a review load (checkout, review of the current branch): the
+--- first file of the diff list and the files sidebar, as configured. The
+--- sidebar opens without taking the focus from the file.
+function M._after_review_load()
+  local cfg = config.get()
+  if cfg.open_first_file then M._open_first_file() end
+  if cfg.open_files_on_load then
+    local files = require("gh-review.ui.files")
+    if not (files.is_open and files.is_open()) then files.show({ focus = false }) end
+  end
+end
+
+--- Open the first file of the diff list, in the order of the files sidebar.
+function M._open_first_file()
+  local first = require("gh-review.ui.files").display_order(state.get_effective_files())[1]
+  if not first then return end
+  local win = file_window()
+  if not win then return end
+  vim.api.nvim_set_current_win(win)
+  M._open_file(first.path)
+end
+
 --- Open a PR file in inline (mini.diff overlay) view.
 --- For commit-scoped review, creates a scratch buffer with the commit's file content
 --- so the overlay reflects the commit vs its parent, not the working tree.
@@ -372,7 +632,7 @@ function M._open_inline(path, line)
   local minidiff = require("gh-review.ui.minidiff")
 
   local buf
-  if active_commit then
+  if active_commit and not state.is_commit_on_disk() then
     local lines = util.git_show_lines(active_commit.oid .. ":" .. path, cwd)
     local short_sha = active_commit.oid:sub(1, 8)
     buf = util.create_scratch_buf("ghreview://commit/" .. short_sha .. "/" .. path, lines, path)
@@ -495,6 +755,8 @@ function M.close()
   close_snacks_picker("gh_review_files")
   close_snacks_picker("gh_review_commits")
   close_snacks_picker("gh_review_stack")
+  M._loaded_pr_number = nil
+  close_snacks_picker("gh_review_gh_stack")
   -- Close trouble comments panel if open
   pcall(function() require("trouble").close("gh_review") end)
   require("gh-review.integrations.diffview").close()
@@ -1032,12 +1294,48 @@ function M.reply()
   M._reply_to_thread(thread)
 end
 
+--- Lines `start_line`..`end_line` of the current buffer, which a suggestion
+--- replaces. Nil where the buffer does not hold the new version of the file
+--- line for line: the base side of the split, the unified view.
+---@param start_line number
+---@param end_line number
+---@return string[]?
+local function suggestion_source(start_line, end_line)
+  local name = vim.api.nvim_buf_get_name(0)
+  if name:match("^ghreview://base/") or name:match("^ghreview://unified/") then return nil end
+  return vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+end
+
+--- `comment_input` options for a comment on `start_line`..`end_line`: the
+--- key that inserts a suggestion block of those lines and, with `suggest`, a
+--- body that starts as one, the cursor on its first line of code. Nil (after
+--- a warning) when `suggest` is asked where there is nothing to suggest on.
+---@param start_line number
+---@param end_line number
+---@param suggest? boolean
+---@return table?
+local function suggestion_input(start_line, end_line, suggest)
+  local lines = suggestion_source(start_line, end_line)
+  if suggest and not lines then
+    vim.notify("GHReview: suggest a change from the new side of the diff (split right side or inline view)", vim.log.levels.WARN)
+    return nil
+  end
+  return {
+    suggestion_lines = lines,
+    body_lines = suggest and util.suggestion_block(lines) or nil,
+    cursor_line = suggest and 2 or nil,
+  }
+end
+
 --- Start a new inline comment thread at cursor, or across a visual range.
 --- When `start_line` and `end_line` are both given, creates a multi-line
 --- thread spanning those lines. With no args, falls back to the cursor line.
+--- `opts.suggest` opens the input on a suggestion block of those lines.
 ---@param start_line? number
 ---@param end_line? number
-function M.new_thread(start_line, end_line)
+---@param opts? { suggest?: boolean }
+function M.new_thread(start_line, end_line, opts)
+  opts = opts or {}
   if not require_active() then return end
 
   local pr = state.get_pr()
@@ -1063,8 +1361,11 @@ function M.new_thread(start_line, end_line)
     and tostring(start_line)
     or (start_line .. "-" .. end_line)
 
-  require("gh-review.ui.comment_input").open({
-    title = "New Thread: " .. rel_path .. ":" .. range_label,
+  local input = suggestion_input(start_line, end_line, opts.suggest)
+  if not input then return end
+
+  require("gh-review.ui.comment_input").open(vim.tbl_extend("force", input, {
+    title = (opts.suggest and "Suggest Change: " or "New Thread: ") .. rel_path .. ":" .. range_label,
     on_submit = function(body)
       vim.notify("GHReview: creating thread...", vim.log.levels.INFO)
       graphql.create_thread(pr.node_id, rel_path, end_line, "RIGHT", body, function(err)
@@ -1076,15 +1377,34 @@ function M.new_thread(start_line, end_line)
         end
       end, start_line)
     end,
-  })
+  }))
+end
+
+--- Suggest a change to the line at the cursor, or to a visual range: a new
+--- pending thread whose body starts as a GitHub suggestion block of those
+--- lines. Edit the code in the block; GitHub offers to apply it on the PR.
+---@param start_line? number
+---@param end_line? number
+function M.suggest_change(start_line, end_line)
+  M.new_thread(start_line, end_line, { suggest = true })
+end
+
+--- Suggest a change like `M.suggest_change`, but post it immediately instead
+--- of holding it in the pending review.
+---@param start_line? number
+---@param end_line? number
+function M.suggest_change_direct(start_line, end_line)
+  M.new_thread_direct(start_line, end_line, { suggest = true })
 end
 
 --- Start an inline comment that is published immediately, instead of being
 --- held back in a pending review the way `M.new_thread` is. Same cursor /
---- visual-range semantics as `M.new_thread`.
+--- visual-range semantics as `M.new_thread`, and the same `opts.suggest`.
 ---@param start_line? number
 ---@param end_line? number
-function M.new_thread_direct(start_line, end_line)
+---@param opts? { suggest?: boolean }
+function M.new_thread_direct(start_line, end_line, opts)
+  opts = opts or {}
   if not require_active() then return end
 
   local pr = state.get_pr()
@@ -1111,8 +1431,11 @@ function M.new_thread_direct(start_line, end_line)
     and tostring(start_line)
     or (start_line .. "-" .. end_line)
 
-  require("gh-review.ui.comment_input").open({
-    title = "Direct Comment: " .. rel_path .. ":" .. range_label,
+  local input = suggestion_input(start_line, end_line, opts.suggest)
+  if not input then return end
+
+  require("gh-review.ui.comment_input").open(vim.tbl_extend("force", input, {
+    title = (opts.suggest and "Suggest Change (direct): " or "Direct Comment: ") .. rel_path .. ":" .. range_label,
     on_submit = function(body)
       vim.notify("GHReview: posting comment...", vim.log.levels.INFO)
       gh.pr_add_review_comment(pr.number, {
@@ -1132,7 +1455,7 @@ function M.new_thread_direct(start_line, end_line)
         end
       end)
     end,
-  })
+  }))
 end
 
 --- Resolve the owner/repo pair for the active PR.
@@ -1406,16 +1729,61 @@ function M.review_current()
     vim.notify("GHReview: review already active, close first", vim.log.levels.WARN)
     return
   end
+  -- `data` is the full metadata already: no second `gh pr view`.
+  local function load(data, callback)
+    vim.notify("GHReview: loading PR #" .. data.number .. " — " .. data.title, vim.log.levels.INFO)
+    M._load_pr_data(data.number, function()
+      M._after_review_load()
+      if callback then callback() end
+    end, hint_of(data), data)
+  end
+
+  -- The PR of this working copy was looked up before (startup detection or an
+  -- earlier review): load it at once, and check the metadata in the
+  -- background. A working copy on another commit may belong to another PR,
+  -- so it gets a fresh lookup.
+  local detected = M._detected
+  local head = vcs.base_commit()
+  if detected and detected.head and detected.head == head then
+    local loaded, fresh = false, nil
+    local function check()
+      if not (loaded and fresh) then return end
+      M._detected = { data = fresh, head = head }
+      local pr = state.get_pr()
+      if not pr or pr.number ~= fresh.number then return end
+      if fresh.headRefOid ~= detected.data.headRefOid or fresh.baseRefOid ~= detected.data.baseRefOid then
+        vim.notify("GHReview: PR #" .. fresh.number .. " changed on GitHub, reloading", vim.log.levels.INFO)
+        state.clear_active_commit()
+        M._load_pr_data(fresh.number, function() M._refresh_views() end, hint_of(fresh), fresh)
+        return
+      end
+      -- Same commits: only the text may have changed.
+      pr.title = fresh.title or pr.title
+      pr.body = fresh.body or pr.body
+      pr.review_decision = fresh.reviewDecision or pr.review_decision
+    end
+    load(detected.data, function()
+      loaded = true
+      check()
+    end)
+    gh.pr_view(detected.data.number, function(err, data)
+      if err or not data then return end
+      fresh = data
+      check()
+    end)
+    return
+  end
+
   vim.notify("GHReview: detecting PR for current branch...", vim.log.levels.INFO)
+  -- Resolve the repo while the PR is looked up, not after.
+  gh.repo_name(function() end)
   gh.pr_view_current(function(err, data)
     if err then
       vim.notify("GHReview: no PR for current branch: " .. err, vim.log.levels.ERROR)
       return
     end
-    vim.schedule(function()
-      vim.notify("GHReview: loading PR #" .. data.number .. " — " .. data.title, vim.log.levels.INFO)
-      M._load_pr_data(data.number)
-    end)
+    M._detected = { data = data, head = head }
+    vim.schedule(function() load(data) end)
   end)
 end
 
@@ -1433,9 +1801,368 @@ function M.checkout_or_pick(pr_number)
   })
 end
 
+--- What a `gh pr list` entry tells about a PR's commits and branch.
+---@param pr table?
+---@return GHReviewCheckoutHint?
+local function pr_hint(pr)
+  if not pr then return nil end
+  local function str(v) return type(v) == "string" and v ~= "" and v or nil end
+  return { head_oid = str(pr.headRefOid), base_oid = str(pr.baseRefOid), head_ref = str(pr.headRefName) }
+end
+
+--- Checkout a PR without loading a review.
+---@param pr_number number
+---@param hint? GHReviewCheckoutHint
+local function checkout_only(pr_number, hint)
+  vim.notify("GHReview: checking out PR #" .. pr_number .. "...", vim.log.levels.INFO)
+  gh.checkout(pr_number, function(err)
+    if err then
+      vim.notify("GHReview: checkout failed: " .. err, vim.log.levels.ERROR)
+      return
+    end
+    vim.notify("GHReview: checked out PR #" .. pr_number, vim.log.levels.INFO)
+  end, hint)
+end
+
+--- Checkout a PR and review it, dropping the commit filter of the PR before.
+---@param pr_number number
+---@param hint? { head_oid?: string, base_oid?: string }
+local function checkout_and_review(pr_number, hint)
+  state.clear_active_commit()
+  M.checkout(pr_number, hint)
+end
+
+--- Check out and review the first (closest to the base) or last open PR of
+--- yours in a native stack.
+---@param stack GHReviewStack
+---@param which "first"|"last"
+function M._review_own_stack_pr(stack, which)
+  gh.viewer_login(function(err, login)
+    if err or not login then
+      vim.notify("GHReview: could not resolve your GitHub login: " .. (err or "unknown"), vim.log.levels.ERROR)
+      return
+    end
+    local pr = require("gh-review.gh_stack").own_pr(stack, login, which)
+    if not pr then
+      vim.notify("GHReview: stack #" .. stack.number .. " has no open PR of yours", vim.log.levels.INFO)
+      return
+    end
+    local function str(v) return v ~= "" and v or nil end
+    checkout_and_review(pr.number, { head_oid = pr.head_oid, base_oid = pr.base_oid, head_ref = str(pr.head_ref) })
+  end)
+end
+
+--- List open PRs in a scope (all, mine, involved in review, by author). The
+--- scope keys switch it in place; with no scope the picker reopens on the last
+--- one. `<cr>` checks out and reviews, the checkout key only checks out.
+---@param scope? GHReviewScope
+function M.pr_list(scope)
+  local pr_picker = require("gh-review.ui.pr_picker")
+  pr_picker.show({
+    title = "PRs",
+    scope = scope or pr_picker.last_scope,
+    on_select = function(n, pr)
+      checkout_and_review(n, pr_hint(pr))
+    end,
+    on_checkout = function(n, pr) checkout_only(n, pr_hint(pr)) end,
+    on_own_stack_pr = M._review_own_stack_pr,
+  })
+end
+
+--- Resolve owner/name of the current repo.
+---@param callback fun(full: string, owner: string, name: string)
+local function with_repo(callback)
+  gh.repo_name(function(err, full)
+    local owner, name = (full or ""):match("^(.+)/(.+)$")
+    if err or not owner then
+      vim.notify("GHReview: could not resolve the repository: " .. (err or "unknown"), vim.log.levels.ERROR)
+      return
+    end
+    callback(full, owner, name)
+  end)
+end
+
+---@param err string
+local function report_stack_error(err)
+  if require("gh-review.gh_stack").is_unsupported_error(err) then
+    vim.notify("GHReview: native PR stacks are not available on this GitHub host", vim.log.levels.WARN)
+    return
+  end
+  if require("gh-review.gh_stack").is_timeout_error(err) then
+    vim.notify(
+      "GHReview: GitHub timed out loading stacks; narrow the scope (mine, review, author): " .. err,
+      vim.log.levels.ERROR
+    )
+    return
+  end
+  vim.notify("GHReview: failed to load stacks: " .. err, vim.log.levels.ERROR)
+end
+
+---@type GHReviewScope
+M._last_stack_scope = { kind = "all" }
+
+--- List the native GitHub stacks that hold a PR in `scope`. `<cr>` opens the
+--- stack panel, the checkout key checks the stack out.
+---@param scope? GHReviewScope
+function M.gh_stacks(scope)
+  local gh_stack = require("gh-review.gh_stack")
+  local scope_mod = require("gh-review.scope")
+  scope = scope or M._last_stack_scope
+  M._last_stack_scope = scope
+  with_repo(function(_, owner, name)
+    vim.notify("GHReview: fetching stacks (" .. scope_mod.label(scope) .. ")...", vim.log.levels.INFO)
+    scope_mod.fetch_all(scope, function(term, cb)
+      graphql.search_stacked_prs(owner, name, term, cb)
+    end, function(err, nodes)
+      if err then
+        report_stack_error(err)
+        return
+      end
+      local stacks = gh_stack.group(nodes or {})
+      if #stacks == 0 then
+        vim.notify("GHReview: no GitHub stacks found (" .. scope_mod.label(scope) .. ")", vim.log.levels.INFO)
+        return
+      end
+      -- Draw the metadata now; merge statuses fill in when they arrive.
+      local picker
+      require("gh-review.stack_status").load(owner .. "/" .. name, stacks, {}, function(status_err)
+        if status_err then
+          report_stack_error(status_err)
+          return
+        end
+        require("gh-review.ui.picker_util").redraw(picker)
+      end)
+      picker = require("gh-review.ui.gh_stack").show_list(stacks, {
+        scope = scope,
+        on_select = function(stack)
+          M.gh_stack_panel(stack.entries[#stack.entries].pr.number)
+        end,
+        on_checkout = M._checkout_stack,
+        on_scope = M.gh_stacks,
+        on_own = M._review_own_stack_pr,
+      })
+    end)
+  end)
+end
+
+--- Checkout a native stack (every open branch under jj, the top PR under git)
+--- and review its topmost open PR.
+---@param stack GHReviewStack
+function M._checkout_stack(stack)
+  local gh_stack = require("gh-review.gh_stack")
+  local top = gh_stack.top_open(stack)
+  if not top then
+    vim.notify("GHReview: every PR of stack #" .. stack.number .. " is merged or closed", vim.log.levels.INFO)
+    return
+  end
+  vim.notify("GHReview: checking out stack #" .. stack.number .. "...", vim.log.levels.INFO)
+  gh.checkout_stack(top.number, gh_stack.open_branches(stack), function(err)
+    if err then
+      vim.notify("GHReview: stack checkout failed: " .. err, vim.log.levels.ERROR)
+      return
+    end
+    vim.notify("GHReview: checked out stack #" .. stack.number .. " at PR #" .. top.number, vim.log.levels.INFO)
+    state.clear_active_commit()
+    M._load_pr_data(top.number, nil, { head_oid = top.head_oid, base_oid = top.base_oid })
+  end, top.head_oid)
+end
+
+--- Delay between two polls of an async merge, and how many polls to make.
+M._merge_poll_ms = 3000
+M._merge_poll_limit = 100
+
+--- Report an async merge result, polling again while it is pending.
+---@param repo string owner/name
+---@param pr_number number PR the merge was requested on
+---@param result { status: string, details: table }?
+---@param label string PRs being merged, e.g. "#1, #2"
+---@param attempt number
+function M._handle_merge_result(repo, pr_number, result, label, attempt)
+  local status = result and result.status
+  local details = result and result.details or {}
+  if status == "merged" then
+    vim.notify("GHReview: merged " .. label, vim.log.levels.INFO)
+  elseif status == "enqueued" then
+    vim.notify("GHReview: added " .. label .. " to the merge queue", vim.log.levels.INFO)
+  elseif status == "failed" then
+    vim.notify("GHReview: merge of " .. label .. " failed: " .. (details.message or "unknown error"), vim.log.levels.ERROR)
+  elseif status == "pending" and details.uuid then
+    if attempt == 0 then
+      vim.notify("GHReview: merging " .. label .. "...", vim.log.levels.INFO)
+    end
+    if attempt >= M._merge_poll_limit then
+      vim.notify("GHReview: merge of " .. label .. " still pending, check it on GitHub", vim.log.levels.WARN)
+      return
+    end
+    vim.defer_fn(function()
+      gh.pr_merge_async_status(repo, pr_number, details.uuid, function(err, next_result)
+        if err then
+          vim.notify("GHReview: could not poll the merge of " .. label .. ": " .. err, vim.log.levels.ERROR)
+          return
+        end
+        M._handle_merge_result(repo, pr_number, next_result, label, attempt + 1)
+      end)
+    end, M._merge_poll_ms)
+  else
+    vim.notify("GHReview: unexpected merge status '" .. tostring(status) .. "'", vim.log.levels.WARN)
+  end
+end
+
+--- Merge the PR at `position` of a stack, and with it every open PR below.
+--- Asks for the merge method (unless a merge queue decides it) and a confirmation.
+---@param repo string owner/name
+---@param stack GHReviewStack
+---@param settings GHReviewMergeSettings
+---@param position number
+function M._merge_stack(repo, stack, settings, position)
+  local gh_stack = require("gh-review.gh_stack")
+  local ok, reason = gh_stack.can_merge(stack, position)
+  if not ok then
+    vim.notify("GHReview: cannot merge yet — " .. reason, vim.log.levels.WARN)
+    return
+  end
+  local target = gh_stack.entry_at(stack, position).pr
+  local nums = {}
+  for _, pr in ipairs(gh_stack.merge_set(stack, position)) do
+    table.insert(nums, "#" .. pr.number)
+  end
+  local label = table.concat(nums, ", ")
+
+  local function confirm(method)
+    local prompt = settings.merge_queue
+        and string.format("Add %s to the merge queue of %s?", label, stack.base)
+      or string.format("Merge %s into %s (%s)?", label, stack.base, method or "default")
+    vim.ui.select({ "Yes", "No" }, { prompt = prompt }, function(choice)
+      if choice ~= "Yes" then return end
+      gh.pr_merge_async(repo, target.number, { merge_method = method, sha = target.head_oid }, function(err, result)
+        if err then
+          vim.notify("GHReview: merge request failed: " .. err, vim.log.levels.ERROR)
+          return
+        end
+        M._handle_merge_result(repo, target.number, result, label, 0)
+      end)
+    end)
+  end
+
+  -- A merge queue ignores the method, and a single allowed method needs no prompt.
+  if settings.merge_queue then
+    confirm(nil)
+  elseif #settings.methods <= 1 then
+    confirm(settings.methods[1])
+  else
+    vim.ui.select(settings.methods, { prompt = "Merge method" }, function(method)
+      if method then confirm(method) end
+    end)
+  end
+end
+
+--- Open the checks window of a PR: failing jobs first. Checks of a head
+--- commit are cached once none is pending; `R` in the window refetches.
+---@param repo string owner/name
+---@param pr GHReviewStackPR
+---@param force? boolean Skip the cache
+---@param win? GHReviewChecksWindow Window to refill instead of opening one
+function M._show_checks(repo, pr, force, win)
+  local cache = require("gh-review.cache")
+  local owner, name = repo:match("^(.+)/(.+)$")
+  win = win or require("gh-review.ui.pr_checks").open(pr, {
+    on_refresh = function() M._show_checks(repo, pr, true, win) end,
+  })
+  local key = pr.head_oid and (repo .. "#" .. pr.number .. "@" .. pr.head_oid) or nil
+  local hit = not force and key and cache.get("checks", key) or nil
+  if type(hit) == "table" and hit.checks then
+    win.set(hit)
+    return
+  end
+  graphql.fetch_pr_checks(owner, name, pr.number, function(err, result)
+    if err then
+      win.set_error(err)
+      return
+    end
+    win.set(result)
+    local settled = true
+    for _, c in ipairs(result.checks) do
+      if c.state == "PENDING" then settled = false end
+    end
+    -- Cache under the commit the checks ran on, which may be newer than ours.
+    if settled and result.head_oid then
+      cache.set("checks", repo .. "#" .. pr.number .. "@" .. result.head_oid, result)
+    end
+  end)
+end
+
+--- Toggle the panel over a native GitHub stack: every PR with whether it can
+--- merge. Defaults to the stack of the PR under review, else of the current
+--- branch. `<cr>` checks out and reviews a PR, the merge key merges up to the PR
+--- under the cursor, the checkout key checks out the whole stack.
+---@param pr_number? number Any PR of the stack
+function M.gh_stack_panel(pr_number)
+  local ui = require("gh-review.ui.gh_stack")
+  if not pr_number and ui.close_panel() then return end
+
+  local function open(number, force)
+    with_repo(function(full, owner, name)
+      graphql.fetch_pr_stack(owner, name, number, function(err, raw, settings)
+        if err then
+          report_stack_error(err)
+          return
+        end
+        if not raw then
+          vim.notify("GHReview: PR #" .. number .. " is not part of a GitHub stack", vim.log.levels.INFO)
+          return
+        end
+        local stack = require("gh-review.gh_stack").parse_stack(raw)
+        local current = state.get_pr()
+        local picker
+        -- Cached statuses apply before the panel draws; the rest redraw it later.
+        require("gh-review.stack_status").load(full, { stack }, { force = force }, function(status_err)
+          if status_err then
+            report_stack_error(status_err)
+            return
+          end
+          require("gh-review.ui.picker_util").redraw(picker, ui.panel_title(stack))
+        end)
+        picker = ui.show_panel(stack, {
+          current_pr = current and current.number or nil,
+          on_review = function(entry)
+            checkout_and_review(entry.pr.number, {
+              head_oid = entry.pr.head_oid,
+              base_oid = entry.pr.base_oid,
+              head_ref = entry.pr.head_ref,
+            })
+          end,
+          on_merge = function(entry) M._merge_stack(full, stack, settings, entry.position) end,
+          on_checkout = function() M._checkout_stack(stack) end,
+          on_own = function(which) M._review_own_stack_pr(stack, which) end,
+          on_refresh = function() open(number, true) end,
+          on_details = function(entry) M._show_checks(full, entry.pr) end,
+        })
+      end)
+    end)
+  end
+
+  if pr_number then
+    open(pr_number)
+    return
+  end
+  local current = state.get_pr()
+  if current then
+    open(current.number)
+    return
+  end
+  gh.pr_view_current(function(err, data)
+    if err or not data then
+      vim.notify("GHReview: no PR under review or for the current branch; list stacks instead", vim.log.levels.WARN)
+      return
+    end
+    open(data.number)
+  end)
+end
+
 --- Select a specific commit for filtered review
 ---@param commit GHReviewCommit
-function M.select_commit(commit)
+---@param after? fun() Runs once the views are rebuilt (see `_refresh_views`)
+function M.select_commit(commit, after)
   if not commit or not commit.oid or commit.oid == "" then
     vim.notify("GHReview: invalid commit", vim.log.levels.ERROR)
     return
@@ -1499,9 +2226,11 @@ function M.select_commit(commit)
     end
   end
 
-  state.set_active_commit(commit)
+  -- After a stack step or `<leader>gpk`, the working copy sits on the commit:
+  -- the views can then edit its files on disk.
+  state.set_active_commit(commit, vcs.base_commit() == commit.oid)
   state.set_commit_files(files)
-  M._refresh_views()
+  M._refresh_views(after)
   vim.notify("GHReview: filtering to commit " .. commit.sha, vim.log.levels.INFO)
 end
 
@@ -1594,26 +2323,68 @@ local function pick_stack_commit(commits, noun, callback)
   end)
 end
 
+--- Whether `jj_commit` is the tip of the loaded PR: it carries the PR head
+--- branch (which also holds after a local rewrite), or it is the PR head or
+--- the last commit of the PR.
+---@param jj_commit GHReviewJJCommit
+---@return boolean
+local function is_pr_tip(jj_commit)
+  local pr = state.get_pr()
+  if not pr then return false end
+  if pr.head_ref and vim.tbl_contains(jj_commit.bookmarks or {}, pr.head_ref) then return true end
+  if pr.head_sha == jj_commit.commit_id then return true end
+  local commits = state.get_commits()
+  local last = commits[#commits]
+  return last ~= nil and last.oid == jj_commit.commit_id
+end
+
+--- Show the loaded PR as a whole, without a commit filter.
+---@param after? fun()
+local function show_whole_pr(after)
+  state.clear_active_commit()
+  M._refresh_views(after)
+  vim.notify("GHReview: showing full PR #" .. state.get_pr().number, vim.log.levels.INFO)
+end
+
+---@class GHReviewStackGotoOpts
+---@field whole_pr_at_tip? boolean Show the whole PR, not one commit, when the commit is the tip of its PR
+---@field open_first_file? boolean Open the first file of the diff list afterwards (if `open_first_file` is on)
+
+--- What to run once the review moved, per `opts.open_first_file`.
+---@param opts GHReviewStackGotoOpts
+---@return fun()?
+local function after_goto(opts)
+  if opts.open_first_file and config.get().open_first_file then return M._open_first_file end
+  return nil
+end
+
 --- Load another PR of the stack and scope the review to `oid` once its data is in.
 ---@param pr_number number
 ---@param title string?
----@param oid string
-local function load_pr_at_commit(pr_number, title, oid)
+---@param jj_commit GHReviewJJCommit
+---@param opts GHReviewStackGotoOpts
+local function load_pr_at_commit(pr_number, title, jj_commit, opts)
+  local oid = jj_commit.commit_id
   vim.notify(
     "GHReview: loading PR #" .. pr_number .. (title and title ~= "" and (" — " .. title) or "") .. "...",
     vim.log.levels.INFO
   )
   -- The old PR's commit filter must not survive into the new one.
   state.clear_active_commit()
+  local after = after_goto(opts)
   M._load_pr_data(pr_number, function()
+    if opts.whole_pr_at_tip and is_pr_tip(jj_commit) then
+      M._refresh_views(after)
+      return
+    end
     local commit = pr_commit_by_oid(oid)
     if commit then
-      M.select_commit(commit)
+      M.select_commit(commit, after)
       return
     end
     -- The commit sits in this PR's stack range but is not one of its commits,
     -- which normally means it has not been pushed yet. Show the whole PR.
-    M._refresh_views()
+    M._refresh_views(after)
     vim.notify(
       "GHReview: PR #" .. pr_number .. " loaded; commit " .. oid:sub(1, 8) .. " is not part of it",
       vim.log.levels.WARN
@@ -1621,13 +2392,44 @@ local function load_pr_at_commit(pr_number, title, oid)
   end)
 end
 
---- Move the review onto an adjacent jj commit: re-scope when it belongs to the
---- PR already loaded, otherwise load the PR of the stack that owns it.
+--- Put the jj working copy on `jj_commit`, so the files on disk (and the
+--- right side of the diff views) are that commit's. A failure is reported but
+--- does not stop the review from moving.
 ---@param jj_commit GHReviewJJCommit
-function M._goto_stack_commit(jj_commit)
+---@param callback fun()
+local function checkout_stack_commit(jj_commit, callback)
+  vcs.jj_move_to(jj_commit.commit_id, function(err, moved)
+    if err then
+      vim.notify("GHReview: jj new " .. jj_commit_label(jj_commit) .. " failed: " .. err, vim.log.levels.WARN)
+    elseif moved then
+      -- Reload the buffers of files `jj new` rewrote.
+      vim.cmd("silent! checktime")
+    end
+    callback()
+  end)
+end
+
+--- Move the review onto a jj commit of the stack: check the commit out in jj,
+--- then re-scope when it belongs to the PR already loaded, otherwise load the
+--- PR of the stack that owns it.
+---@param jj_commit GHReviewJJCommit
+---@param opts? GHReviewStackGotoOpts
+function M._goto_stack_commit(jj_commit, opts)
+  checkout_stack_commit(jj_commit, function() M._review_stack_commit(jj_commit, opts or {}) end)
+end
+
+--- The review half of `_goto_stack_commit`.
+---@param jj_commit GHReviewJJCommit
+---@param opts GHReviewStackGotoOpts
+function M._review_stack_commit(jj_commit, opts)
+  local after = after_goto(opts)
+  if opts.whole_pr_at_tip and is_pr_tip(jj_commit) then
+    show_whole_pr(after)
+    return
+  end
   local commit = pr_commit_by_oid(jj_commit.commit_id)
   if commit then
-    M.select_commit(commit)
+    M.select_commit(commit, after)
     return
   end
 
@@ -1659,7 +2461,7 @@ function M._goto_stack_commit(jj_commit)
         )
         return
       end
-      load_pr_at_commit(data.number, data.title, jj_commit.commit_id)
+      load_pr_at_commit(data.number, data.title, jj_commit, opts)
     end)
   end)
 end
@@ -1711,7 +2513,7 @@ local function navigate_stack(direction)
         return
       end
       pick_stack_commit(commits, dir.noun, function(commit)
-        M._goto_stack_commit(commit)
+        M._goto_stack_commit(commit, { open_first_file = true })
       end)
     end)
   end)
@@ -1806,16 +2608,20 @@ function M.stack_panel()
         current_change_id = current_change_id,
         pr_change_ids = pr_change_ids,
         truncated = truncated,
+        -- A PR's entry in the picker is its tip commit: picking it means the PR.
         on_select = function(commit)
-          M._goto_stack_commit(commit)
+          M._goto_stack_commit(commit, { whole_pr_at_tip = true, open_first_file = true })
         end,
       })
     end)
   end)
 end
 
---- Refresh all views after commit selection change
-function M._refresh_views()
+--- Refresh all views after commit selection change. `after`, when given, runs
+--- once the views are rebuilt (it opens a file), and the files sidebar then
+--- reopens without taking the focus from it.
+---@param after? fun()
+function M._refresh_views(after)
   -- Close diff split
   require("gh-review.ui.diff_review").close()
   -- And the unified buffer, which renders a fixed snapshot of the diff: after a
@@ -1840,7 +2646,8 @@ function M._refresh_views()
 
   -- Reopen views with updated data after a short delay
   vim.defer_fn(function()
-    require("gh-review.ui.files").show()
+    if after then after() end
+    require("gh-review.ui.files").show(after and { focus = false } or nil)
     if trouble_was_open then
       pcall(function()
         require("trouble").open("gh_review")
@@ -1916,11 +2723,28 @@ function M._setup_keymaps()
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
     M.new_thread_direct(start_line, end_line)
   end, vim.tbl_extend("force", opts, { desc = "New multi-line comment (posted immediately)" }))
+  map(km.suggest_change, M.suggest_change, "Suggest a change (pending review)")
+  vim.keymap.set("x", prefix .. km.suggest_change, function()
+    local a = vim.fn.line("v")
+    local b = vim.fn.line(".")
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
+    M.suggest_change(math.min(a, b), math.max(a, b))
+  end, vim.tbl_extend("force", opts, { desc = "Suggest a change to the selected lines" }))
+  map(km.suggest_change_direct, M.suggest_change_direct, "Suggest a change (posted immediately)")
+  vim.keymap.set("x", prefix .. km.suggest_change_direct, function()
+    local a = vim.fn.line("v")
+    local b = vim.fn.line(".")
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
+    M.suggest_change_direct(math.min(a, b), math.max(a, b))
+  end, vim.tbl_extend("force", opts, { desc = "Suggest a change to the selected lines (posted immediately)" }))
   map(km.pending_review, M.pending_review, "Review/submit unsubmitted comments")
   map(km.review_pr, M.review_pr, "Approve / comment / request changes on the PR")
   map(km.next_stack, M.next_stack_commit, "Next commit in the jj stack")
   map(km.prev_stack, M.prev_stack_commit, "Previous commit in the jj stack")
   map(km.stack, M.stack_panel, "Toggle the jj stack picker")
+  map(km.pr_list, function() M.pr_list() end, "List PRs (all / mine / review / author)")
+  map(km.gh_stacks, function() M.gh_stacks() end, "List GitHub PR stacks")
+  map(km.gh_stack, function() M.gh_stack_panel() end, "Toggle the GitHub stack panel (merge status)")
   map(km.toggle_resolve, M.resolve, "Toggle resolve")
   map(km.hover, M.show_hover, "View comment at cursor")
   map(km.description, M.description, "PR description")
@@ -1933,6 +2757,7 @@ function M._setup_keymaps()
   map(km.toggle_linematch, M.toggle_linematch, "Toggle linematch (char highlights vs grouped blocks)")
   map(km.toggle_view, M.toggle_view, "Toggle split / inline view")
   map(km.refresh, M.refresh, "Refresh PR data")
+  map(km.local_diff, M.toggle_local_diff, "Toggle the local jj diff of the PR")
   map(km.close, M.close, "Close review")
 
   -- ]c / [c with fallthrough

@@ -14,6 +14,18 @@ end
 --- Get the icon for a review decision
 ---@param decision string? e.g. "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"
 ---@return string icon (may be empty string)
+--- Crop a PR title to `config.title_max_length` characters, ending it with
+--- "…" when cut. Counts characters, not bytes, so multibyte titles are not
+--- split inside a character.
+---@param title string?
+---@return string
+function M.crop_title(title)
+  title = title or ""
+  local max = config.get().title_max_length or 0
+  if max <= 0 or vim.fn.strchars(title) <= max then return title end
+  return vim.fn.strcharpart(title, 0, math.max(max - 1, 0)) .. "…"
+end
+
 function M.review_icon(decision)
   local icons = config.get().icons
   if decision == "APPROVED" then
@@ -24,6 +36,25 @@ function M.review_icon(decision)
     return icons.review_required
   end
   return ""
+end
+
+--- A GitHub suggestion block proposing `lines` as the new content of the
+--- commented lines. The fence is longer than any run of backticks in `lines`,
+--- so code that holds a fence of its own does not end the block early.
+---@param lines string[]
+---@return string[]
+function M.suggestion_block(lines)
+  local longest = 2
+  for _, line in ipairs(lines) do
+    for run in line:gmatch("`+") do
+      longest = math.max(longest, #run)
+    end
+  end
+  local fence = string.rep("`", longest + 1)
+  local block = { fence .. "suggestion" }
+  vim.list_extend(block, lines)
+  table.insert(block, fence)
+  return block
 end
 
 --- Build context lines from a list of comments (for reply UI)

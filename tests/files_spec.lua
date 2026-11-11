@@ -247,4 +247,229 @@ describe("files", function()
       assert.are.same(from_items, order(file_list))
     end)
   end)
+
+  describe("sync_selection / sync_current", function()
+    local moved
+
+    --- Stub snacks with a picker whose sorted index space is `iter_items`.
+    --- `list.items` is set to something *different* on purpose: it is the raw
+    --- item table, which stops matching the row numbering once the matcher's
+    --- top-k results kick in, and must not be what we index by.
+    ---@param iter_items table[]
+    ---@param raw_items? table[]
+    local function stub_picker(iter_items, raw_items)
+      moved = nil
+      local picker = {
+        list = {
+          items = raw_items or {},
+          move = function(_, idx, absolute) moved = { idx = idx, absolute = absolute } end,
+        },
+      }
+      function picker:iter()
+        local i = 0
+        return function()
+          i = i + 1
+          if iter_items[i] then return iter_items[i], i end
+        end
+      end
+      package.loaded["snacks"] = { picker = { get = function() return { picker } end } }
+    end
+
+    local function item(rel_path)
+      return { file = vim.fn.getcwd() .. "/" .. rel_path }
+    end
+
+    after_each(function()
+      package.loaded["snacks"] = nil
+    end)
+
+    it("moves the cursor to the row holding the file", function()
+      stub_picker({ item("src/a.lua"), item("src/b.lua"), item("src/c.lua") })
+
+      files.sync_selection("src/b.lua")
+
+      assert.are.same({ idx = 2, absolute = true }, moved)
+    end)
+
+    it("indexes the picker's sorted rows, not the raw item table", function()
+      -- What the rows show, in order
+      local iter_items = { item("src/b.lua"), item("src/a.lua") }
+      -- What `list.items` happens to hold — reversed, as a filtered list would
+      local raw_items = { item("src/a.lua"), item("src/b.lua") }
+      stub_picker(iter_items, raw_items)
+
+      files.sync_selection("src/a.lua")
+
+      -- Row 2 is src/a.lua; indexing list.items would have said row 1
+      assert.are.same({ idx = 2, absolute = true }, moved)
+    end)
+
+    it("does nothing when the file is not in the list", function()
+      stub_picker({ item("src/a.lua") })
+
+      files.sync_selection("src/absent.lua")
+
+      assert.is_nil(moved)
+    end)
+
+    it("does nothing when the picker is closed", function()
+      package.loaded["snacks"] = { picker = { get = function() return {} end } }
+
+      files.sync_selection("src/a.lua")
+
+      assert.is_nil(moved)
+    end)
+
+    it("stays silent when snacks is unavailable", function()
+      -- Runs on every buffer switch, so it must not notify
+      package.loaded["snacks"] = nil
+      local orig_require = _G.require
+      local notifications = {}
+      local orig_notify = vim.notify
+      vim.notify = function(msg) table.insert(notifications, msg) end
+
+      files.sync_selection("src/a.lua")
+      files.sync_current()
+
+      vim.notify = orig_notify
+      _G.require = orig_require
+      assert.are.same({}, notifications)
+    end)
+
+    it("syncs to a working-tree buffer's path", function()
+      stub_picker({ item("src/a.lua"), item("src/b.lua") })
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(buf, vim.fn.getcwd() .. "/src/b.lua")
+
+      files.sync_current(buf)
+
+      assert.are.same({ idx = 2, absolute = true }, moved)
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    it("syncs from the review's scratch buffers too", function()
+      local names = {
+        "ghreview://base/src/b.lua",
+        "ghreview://commit/abc1234/src/b.lua",
+        "ghreview://unified/src/b.lua",
+      }
+      for _, name in ipairs(names) do
+        stub_picker({ item("src/a.lua"), item("src/b.lua") })
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_buf_set_name(buf, name)
+
+        files.sync_current(buf)
+
+        assert.are.same({ idx = 2, absolute = true }, moved, name)
+        vim.api.nvim_buf_delete(buf, { force = true })
+      end
+    end)
+
+    it("ignores buffers that are not PR files", function()
+      stub_picker({ item("src/a.lua") })
+      local unnamed = vim.api.nvim_create_buf(false, true)
+      local outside = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_name(outside, "/somewhere/else/src/a.lua")
+
+      files.sync_current(unnamed)
+      assert.is_nil(moved)
+      files.sync_current(outside)
+      assert.is_nil(moved)
+
+      vim.api.nvim_buf_delete(unnamed, { force = true })
+      vim.api.nvim_buf_delete(outside, { force = true })
+    end)
+  end)
+
+  describe("show", function()
+    it("keeps an open sidebar instead of opening a second one", function()
+      local state = require("gh-review.state")
+      state.set_files({ { path = "a.lua", status = "modified" } })
+      local opened = 0
+      package.loaded["snacks"] = { picker = {
+        pick = function() opened = opened + 1 end,
+        get = function() return { {} } end,
+      } }
+      files.show()
+      package.loaded["snacks"] = nil
+      state.clear()
+      assert.are.equal(0, opened)
+    end)
+
+    it("opens without focus when asked", function()
+      local state = require("gh-review.state")
+      state.set_files({ { path = "a.lua", status = "modified" } })
+      local opts
+      package.loaded["snacks"] = { picker = { pick = function(o) opts = o end, get = function() return {} end } }
+      package.loaded["snacks.picker.format"] = { tree = function() return {} end }
+      files.show({ focus = false })
+      package.loaded["snacks"] = nil
+      package.loaded["snacks.picker.format"] = nil
+      state.clear()
+      assert.is_false(opts.focus)
+    end)
+  end)
+
+  describe("renames", function()
+    local file = { path = "lua/new/b.lua", old_path = "lua/old/a.lua", status = "renamed" }
+
+    it("labels the full path change, or file names only", function()
+      assert.are.equal("lua/old/a.lua → lua/new/b.lua", files.rename_label(file, true))
+      assert.are.equal("a.lua → b.lua", files.rename_label(file, false))
+    end)
+
+    it("shows the full change by default, and the toggle switches to file names", function()
+      local state = require("gh-review.state")
+      state.set_files({ file })
+      local opts
+      package.loaded["snacks"] = { picker = { pick = function(o) opts = o end, get = function() return {} end } }
+      package.loaded["snacks.picker.format"] = { tree = function() return {} end }
+      files._full_rename_paths = nil
+      files.show()
+      local leaf
+      for _, item in ipairs(opts.items) do
+        if not item._is_dir then leaf = item end
+      end
+      local function row() return table.concat(vim.tbl_map(function(c) return c[1] end, opts.format(leaf, {})), "") end
+      assert.is_truthy(row():find("lua/old/a.lua → lua/new/b.lua", 1, true))
+      assert.are.equal("gh_review_toggle_rename_paths", opts.win.list.keys["p"][1])
+      opts.actions.gh_review_toggle_rename_paths({ list = { set_target = function() end, update = function() end, cursor = 1, top = 1 } })
+      assert.is_truthy(row():find("a.lua → b.lua", 1, true))
+      assert.is_nil(row():find("lua/old", 1, true))
+      package.loaded["snacks"] = nil
+      package.loaded["snacks.picker.format"] = nil
+      files._full_rename_paths = nil
+      state.clear()
+    end)
+
+    it("starts with file names when full_rename_paths is off", function()
+      config.setup({ full_rename_paths = false })
+      files._full_rename_paths = nil
+      local state = require("gh-review.state")
+      state.set_files({ file })
+      local opts
+      package.loaded["snacks"] = { picker = { pick = function(o) opts = o end, get = function() return {} end } }
+      package.loaded["snacks.picker.format"] = { tree = function() return {} end }
+      files.show()
+      local leaf
+      for _, item in ipairs(opts.items) do
+        if not item._is_dir then leaf = item end
+      end
+      local row = table.concat(vim.tbl_map(function(c) return c[1] end, opts.format(leaf, {})), "")
+      assert.is_truthy(row:find("a.lua → b.lua", 1, true))
+      package.loaded["snacks"] = nil
+      package.loaded["snacks.picker.format"] = nil
+      files._full_rename_paths = nil
+      state.clear()
+    end)
+
+    it("makes the old path searchable", function()
+      local items = files._build_items({ file }, "/repo")
+      local leaf
+      for _, item in ipairs(items) do
+        if not item._is_dir then leaf = item end
+      end
+      assert.is_truthy(leaf.text:find("lua/old/a.lua", 1, true))
+    end)
+  end)
 end)

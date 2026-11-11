@@ -22,7 +22,18 @@ function M.toggle()
 end
 
 --- Show the commits picker
-function M.show()
+--- Whether the commits panel is open.
+---@return boolean
+function M.is_open()
+  local ok, Snacks = pcall(require, "snacks")
+  if not ok then return false end
+  return #(Snacks.picker.get({ source = "gh_review_commits" }) or {}) > 0
+end
+
+--- Show the commits panel. `opts.focus = false` opens it without moving the
+--- cursor into it.
+---@param opts? { focus?: false }
+function M.show(opts)
   local commits = state.get_commits()
   if #commits == 0 then
     vim.notify("GHReview: no commits", vim.log.levels.INFO)
@@ -50,6 +61,7 @@ function M.show()
 
   Snacks.picker.pick({
     source = "gh_review_commits",
+    focus = opts and opts.focus,
     title = "PR Commits",
     items = items,
     layout = { preset = "select", preview = false },

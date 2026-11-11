@@ -18,6 +18,7 @@ end
 describe("stack", function()
   local stack_ui
   local picker_config
+  local gh, orig_prs_by_head
 
   before_each(function()
     config.setup()
@@ -32,11 +33,17 @@ describe("stack", function()
       },
     }
 
+    -- PR numbers are looked up in the background; never reach the real gh.
+    gh = require("gh-review.gh")
+    orig_prs_by_head = gh.prs_by_head
+    gh.prs_by_head = function(_, cb) cb(nil, {}) end
+
     package.loaded["gh-review.ui.stack"] = nil
     stack_ui = require("gh-review.ui.stack")
   end)
 
   after_each(function()
+    gh.prs_by_head = orig_prs_by_head
     package.loaded["snacks"] = nil
     package.loaded["gh-review.ui.stack"] = nil
   end)
@@ -179,7 +186,8 @@ describe("stack", function()
         assert.are.equal(picker_util.ACTIVE_ENTRY, formatted[i][2])
       end
       -- Ordinary entries keep their own highlights
-      assert.are.equal("Identifier", picker_config.format(picker_config.items[1])[2][2])
+      assert.are.equal("Number", picker_config.format(picker_config.items[1])[2][2])
+      assert.are.equal("Identifier", picker_config.format(picker_config.items[1])[4][2])
 
       local viewed
       picker_config.on_show({
@@ -206,8 +214,10 @@ describe("stack", function()
       local formatted = picker_config.format(picker_config.items[1])
       assert.are.equal("> ", formatted[1][1])
       assert.are.equal(require("gh-review.ui.picker_util").ACTIVE, formatted[1][2])
-      assert.are.equal("aaaa1111", formatted[2][1])
-      assert.are.equal(" tip", formatted[3][1])
+      -- PR number first, its place in the stack, then id and title.
+      assert.are.equal("#7     ", formatted[2][1])
+      assert.are.equal("aaaa1111", formatted[4][1])
+      assert.are.equal(" tip", formatted[5][1])
 
       local rendered = table.concat(vim.tbl_map(function(part) return part[1] end, formatted), "")
       assert.is_truthy(rendered:find("pr%-two"))
@@ -219,7 +229,7 @@ describe("stack", function()
       stack_ui.show({ jj_commit("aaaa1111aaaa", "") }, { on_select = function() end })
       local formatted = picker_config.format(picker_config.items[1])
       assert.are.equal("  ", formatted[1][1])
-      assert.is_truthy(formatted[3][1]:find("no description"))
+      assert.is_truthy(formatted[5][1]:find("no description"))
     end)
 
     it("closes the picker and hands the commit to on_select on confirm", function()
@@ -248,6 +258,71 @@ describe("stack", function()
       assert.are.equal("clear_commit", picker_config.win.input.keys["x"][1])
       assert.are.equal("clear_commit", picker_config.win.list.keys["x"][1])
       assert.is_function(picker_config.actions.clear_commit)
+    end)
+  end)
+
+  describe("PR numbers and positions", function()
+    local stack = {
+      jj_commit("aaaa1111aaaa", "unpushed"),
+      jj_commit("bbbb2222bbbb", "top of two", { "two" }),
+      jj_commit("cccc3333cccc", "bottom of two"),
+      jj_commit("dddd4444dddd", "one", { "one" }),
+    }
+
+    it("groups commits under the nearest bookmark at or above them", function()
+      assert.are.same({ [2] = { "two" }, [3] = { "two" }, [4] = { "one" } }, stack_ui.pr_heads(stack))
+    end)
+
+    it("looks the PRs up by branch and numbers them in their native stack", function()
+      local asked
+      gh.prs_by_head = function(branches, cb) asked = branches; cb(nil, { one = 10, two = 11 }) end
+      gh.repo_name = function(cb) cb(nil, "o/r") end
+      local graphql = require("gh-review.graphql")
+      local orig_fetch = graphql.fetch_pr_stack
+      graphql.fetch_pr_stack = function(_, _, number, cb)
+        assert.are.equal(10, number)
+        cb(nil, { number = 3, size = 5, entries = { nodes = {
+          { position = 2, pullRequest = { number = 10 } },
+          { position = 3, pullRequest = { number = 11 } },
+        } } })
+      end
+      local redrawn = 0
+      local picker_util = require("gh-review.ui.picker_util")
+      local orig_redraw = picker_util.redraw
+      picker_util.redraw = function() redrawn = redrawn + 1 end
+
+      stack_ui.show(stack, { on_select = function() end })
+
+      graphql.fetch_pr_stack = orig_fetch
+      picker_util.redraw = orig_redraw
+      assert.are.same({ "two", "one" }, asked)
+      local items = picker_config.items
+      assert.is_nil(items[1]._pr_number)
+      assert.are.same({ 11, "3/5" }, { items[2]._pr_number, items[2]._pr_position })
+      assert.are.same({ 11, "3/5" }, { items[3]._pr_number, items[3]._pr_position })
+      assert.are.same({ 10, "2/5" }, { items[4]._pr_number, items[4]._pr_position })
+      assert.are.equal(1, redrawn)
+      local row = table.concat(vim.tbl_map(function(p) return p[1] end, picker_config.format(items[2])), "")
+      assert.is_truthy(row:find("#11    3/5   bbbb2222 top of two", 1, true))
+      assert.is_truthy(items[2].text:find("#11", 1, true))
+    end)
+
+    it("falls back to the order in the jj stack without a native stack", function()
+      gh.prs_by_head = function(_, cb) cb(nil, { one = 10, two = 11 }) end
+      gh.repo_name = function(cb) cb(nil, "o/r") end
+      local graphql = require("gh-review.graphql")
+      local orig_fetch = graphql.fetch_pr_stack
+      graphql.fetch_pr_stack = function(_, _, _, cb) cb(nil, nil) end
+      stack_ui.show(stack, { on_select = function() end })
+      graphql.fetch_pr_stack = orig_fetch
+      assert.are.equal("2/2", picker_config.items[2]._pr_position)
+      assert.are.equal("1/2", picker_config.items[4]._pr_position)
+    end)
+
+    it("crops long descriptions like the PR list", function()
+      config.setup({ title_max_length = 10 })
+      stack_ui.show({ jj_commit("aaaa1111aaaa", "a very long commit description") }, { on_select = function() end })
+      assert.are.equal(" a very lo…", picker_config.format(picker_config.items[1])[5][1])
     end)
   end)
 end)

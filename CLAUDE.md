@@ -14,6 +14,11 @@ lua/gh-review/
   diff.lua          -- Unified diff parser and thread line mapping
   vcs.lua           -- git/jj layout detection (git-dir, gh repo id, bookmarks, stack)
   util.lua          -- git plumbing helpers (merge base, per-commit diff args)
+  scope.lua         -- PR list scopes (all/mine/review/author) -> search queries
+  gh_stack.lua      -- Native GitHub stack parsing and merge rules
+  stack_status.lua  -- Lazy, cached merge status for native stacks
+  pr_content.lua    -- PR files/diff/commits from cache, local git, or GitHub
+  cache.lua         -- Commit-keyed memory + disk cache (stdpath('cache'))
   reviewed_store.lua -- Persisted per-PR "reviewed" file marks
   health.lua        -- :checkhealth gh-review
   ui/
@@ -23,12 +28,15 @@ lua/gh-review/
     description.lua -- PR description page
     diagnostics.lua -- vim.diagnostic integration for comment threads
     diff_review.lua -- Native Neovim diff split (base vs working)
+    filters.lua     -- Filter manager of the PR and stack lists (multi-select toggle)
     files.lua       -- File tree sidebar (snacks.nvim picker)
     minidiff.lua    -- mini.diff integration (gutter signs + overlay)
     picker_util.lua -- Shared picker highlight groups + focus-current-entry
     pr_picker.lua   -- PR selection picker (snacks.nvim)
     review_submit.lua -- Pending-review panel (list + submit as comment/approve/reject)
     stack.lua       -- jj stack picker (trunk..tip)
+    gh_stack.lua    -- Native GitHub stack list + stack panel (merge status, merge)
+    pr_checks.lua   -- Floating checks window for one PR (failing jobs first)
     unified.lua     -- Unified single-buffer diff view
   integrations/
     diffview.lua    -- diffview.nvim integration
@@ -47,7 +55,8 @@ tests/
 
 - **Async-first**: All `gh` CLI calls go through `gh.lua:M.run()` which uses `vim.system` with callbacks. Results are dispatched via `vim.schedule`.
 - **Central state**: `state.lua` holds all PR data. `state.is_active()` gates most operations.
-- **Parallel loading**: `_load_pr_data()` in `init.lua` fires 4 async operations in parallel (metadata chain, files, diff, comments) and uses a countdown latch (`pending`) to join.
+- **Parallel loading**: `_load_pr_data()` in `init.lua` fires 3 async operations in parallel (metadata + threads, content, comments) and uses a countdown latch (`pending`) to join. `gh.repo_name` is memoized, so threads start without waiting for `pr_view`; callers that already have the metadata pass it as `meta` to skip `pr_view`. Content (files, diff, commits) comes from `pr_content.lua`: cache, then local git, then GitHub (diff built from the REST file patches).
+- **Metadata first**: pickers open on cheap fields and fill in expensive ones (review decisions, merge status, checks) later, redrawing with `picker_util.redraw`. Cache keys must name the commits a value was computed from.
 - **GraphQL for threads**: Review threads (inline comments) use the GraphQL API because the REST API doesn't expose them properly. Simple operations (PR view, diff, files) use `gh pr` commands.
 
 ## Running tests

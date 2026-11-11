@@ -124,6 +124,26 @@ describe("vcs", function()
       assert.are.equal("origin", ctx.remote)
     end)
 
+    it("treats a jj workspace that is a git worktree as git, with the shared remote", function()
+      local root = fixture({
+        ["main/.git/HEAD"] = "ref: refs/heads/main\n",
+        ["main/.git/config"] = GIT_CONFIG:gsub('"origin"', '"upstream"'),
+        ["main/.git/worktrees/ws/HEAD"] = string.rep("a", 40) .. "\n",
+        ["main/.git/worktrees/ws/commondir"] = "../..\n",
+        ["main/.jj/repo/store/git_target"] = "../../../.git",
+        -- jj >= 0.34: the secondary workspace is a git worktree too
+        ["ws/.git"] = "gitdir: ../main/.git/worktrees/ws\n",
+        ["ws/.jj/repo"] = "../../main/.jj/repo",
+      })
+      local ctx = vcs.context(root .. "/ws")
+      assert.are.equal("git", ctx.kind)
+      assert.are.equal(root .. "/ws", ctx.jj_root)
+      assert.are.equal(root .. "/main/.git/worktrees/ws", ctx.dot_git)
+      assert.is_nil(ctx.git_dir)
+      assert.is_nil(ctx.gh_env)
+      assert.are.equal("upstream", ctx.remote)
+    end)
+
     it("identifies the repo via GH_REPO when the git store is bare", function()
       local root = fixture({
         [".jj/repo/store/git_target"] = "git",
@@ -379,6 +399,69 @@ describe("vcs", function()
       assert.are.same({ "jj", "new", "feat/x@origin" }, captured[2].cmd)
     end)
 
+    it("fetches every given branch, then goes on top of the target", function()
+      local root = ws_fixture()
+      local captured = {}
+      orig_system = stub_system({ { code = 0, stdout = "", stderr = "" } }, captured)
+
+      local done = false
+      vcs.jj_checkout("b3", function() done = true end, root, { "b1", "b2", "b3" })
+      vim.wait(200, function() return done end)
+
+      assert.are.same(
+        { "jj", "git", "fetch", "--remote", "origin", "-b", "b1", "-b", "b2", "-b", "b3" },
+        captured[1].cmd
+      )
+      assert.are.same({ "jj", "new", "b3@origin" }, captured[2].cmd)
+    end)
+
+    it("skips the fetch and goes on the head when jj already has it", function()
+      local root = ws_fixture()
+      local captured = {}
+      orig_system = stub_system({
+        { code = 0, stdout = "abc123", stderr = "" }, -- jj log present(abc123)
+        { code = 0, stdout = "", stderr = "" }, -- jj new
+      }, captured)
+      local fetched = false
+      local done, err = false, "unset"
+      vcs.jj_checkout("feat/x", function(e) err = e; done = true end, root, nil, {
+        head_oid = "abc123",
+        on_fetch = function() fetched = true end,
+      })
+      vim.wait(200, function() return done end)
+      assert.is_nil(err)
+      assert.is_false(fetched)
+      assert.are.same({ "jj", "--ignore-working-copy", "log", "-r", "present(abc123)", "--no-graph", "-T", "commit_id" }, captured[1].cmd)
+      assert.are.same({ "jj", "new", "abc123" }, captured[2].cmd)
+    end)
+
+    it("fetches when jj does not have the head, announcing it", function()
+      local root = ws_fixture()
+      local captured = {}
+      orig_system = stub_system({
+        { code = 0, stdout = "", stderr = "" }, -- present() is empty
+        { code = 0, stdout = "", stderr = "" }, -- jj git fetch
+        { code = 0, stdout = "", stderr = "" }, -- jj new
+      }, captured)
+      local fetched = false
+      local done = false
+      vcs.jj_checkout("feat/x", function() done = true end, root, nil, {
+        head_oid = "abc123",
+        on_fetch = function() fetched = true end,
+      })
+      vim.wait(200, function() return done end)
+      assert.is_true(fetched)
+      assert.are.same({ "jj", "git", "fetch", "--remote", "origin", "-b", "feat/x" }, captured[2].cmd)
+      assert.are.same({ "jj", "new", "feat/x@origin" }, captured[3].cmd)
+    end)
+
+    it("does not pass a non-hex head to jj", function()
+      local root = ws_fixture()
+      local got
+      vcs.jj_has_commit("main; rm", function(h) got = h end, root)
+      assert.is_false(got)
+    end)
+
     it("uses the repo's remote name when it is not origin", function()
       local root = fixture({
         [".jj/repo/store/git_target"] = "git",
@@ -483,7 +566,8 @@ describe("vcs", function()
       assert.are.equal("", commits[2].author)
 
       assert.are.equal("jj", captured[1].cmd[1])
-      assert.is_truthy(vim.tbl_contains(captured[1].cmd, "children(abc123)"))
+      -- Empty working copies (what `jj new` leaves on a commit) are not stack commits.
+      assert.is_truthy(vim.tbl_contains(captured[1].cmd, "children(abc123) ~ (working_copies() & empty())"))
       assert.are.equal(root, captured[1].opts.cwd)
     end)
 
@@ -491,7 +575,35 @@ describe("vcs", function()
       local root = ws_fixture()
       local captured = {}
       collect(root, "parents", { code = 0, stdout = "cccc3333\tppqqrrss\t\t\tAda\tnow\tbase\n", stderr = "" }, captured)
-      assert.is_truthy(vim.tbl_contains(captured[1].cmd, "parents(abc123)"))
+      assert.is_truthy(vim.tbl_contains(captured[1].cmd, "parents(abc123) ~ (working_copies() & empty())"))
+    end)
+
+    it("does not count the empty working copy on a commit as its child (real jj)", function()
+      if vim.fn.executable("jj") == 0 then return pending("jj is not installed") end
+      local dir = vim.fn.tempname()
+      vim.fn.mkdir(dir, "p")
+      local function jj(args)
+        local r = vim.system(vim.list_extend({ "jj", "--config", "user.name=T", "--config", "user.email=t@t" }, args),
+          { text = true, cwd = dir }):wait()
+        assert(r.code == 0, table.concat(args, " ") .. ": " .. (r.stderr or ""))
+        return vim.trim(r.stdout or "")
+      end
+      jj({ "git", "init", "--colocate" })
+      for _, name in ipairs({ "one", "two" }) do
+        local fd = assert(io.open(dir .. "/" .. name, "w"))
+        fd:write(name)
+        fd:close()
+        jj({ "commit", "-m", name })
+      end
+      local one = jj({ "log", "-r", "@--", "--no-graph", "-T", "commit_id" })
+      -- What a stack step does: an empty working copy on top of the commit.
+      jj({ "new", one })
+      orig_system = vim.system -- restored by after_each; nothing is stubbed here
+      local done, commits
+      vcs.jj_adjacent(one, "children", function(_, c) commits, done = c, true end, dir)
+      vim.wait(5000, function() return done end)
+      vim.fn.delete(dir, "rf")
+      assert.are.same({ "two" }, vim.tbl_map(function(c) return c.description end, commits))
     end)
 
     it("returns an empty list at the tip of the stack", function()
@@ -809,6 +921,140 @@ describe("vcs", function()
       assert.is_truthy(lines:find("jj", 1, true))
       assert.is_truthy(lines:find("backing git dir", 1, true))
       assert.is_truthy(lines:find("GH_REPO: theochap/gh%-review.nvim"))
+    end)
+  end)
+
+  describe("base_commit", function()
+    it("returns HEAD's commit id in a git repo and nil outside one", function()
+      local dir = vim.fn.tempname()
+      vim.fn.mkdir(dir, "p")
+      local function git(args)
+        return vim.system(vim.list_extend({ "git", "-C", dir }, args), { text = true }):wait()
+      end
+      git({ "init", "-q" })
+      git({ "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "c" })
+      local head = vim.trim(git({ "rev-parse", "HEAD" }).stdout)
+      vcs.invalidate()
+      assert.are.equal(head, vcs.base_commit(dir))
+      vim.fn.delete(dir, "rf")
+
+      local empty = vim.fn.tempname()
+      vim.fn.mkdir(empty, "p")
+      vcs.invalidate()
+      assert.is_nil(vcs.base_commit(empty))
+      vim.fn.delete(empty, "rf")
+    end)
+  end)
+  describe("local PR revsets", function()
+    it("takes the head bookmark, unpushed work above it, else the pushed head", function()
+      local tip = 'coalesce(bookmarks(exact:"feat"), present(abc123))'
+      local above = "(" .. tip .. "::@ ~ " .. tip .. ")"
+      local marked = "(" .. above .. " & (bookmarks() | remote_bookmarks()))"
+      local unpushed = "(" .. above .. " ~ ::" .. marked .. " ~ " .. marked .. "::)"
+      assert.are.equal(
+        "coalesce(heads((" .. tip .. " | " .. unpushed .. ") ~ empty()), " .. tip .. ")",
+        vcs.local_pr_head_revset({ head_ref = "feat", head_oid = "abc123" })
+      )
+    end)
+
+    it("quotes branch names and drops a non-hex oid", function()
+      local revset = vcs.local_pr_head_revset({ head_ref = 'a"b', head_oid = "main; rm" })
+      assert.is_truthy(revset:find('bookmarks(exact:"a\\"b")', 1, true))
+      assert.is_nil(revset:find("rm", 1, true))
+      assert.is_nil(vcs.local_pr_head_revset({}))
+    end)
+
+    it("takes the base branch, local and remote, and the pushed base", function()
+      assert.are.equal(
+        'bookmarks(exact:"main") | remote_bookmarks(exact:"main") | present(def456)',
+        vcs.local_pr_base_revset({ base_ref = "main", base_oid = "def456" })
+      )
+      assert.is_nil(vcs.local_pr_base_revset({}))
+    end)
+  end)
+
+  describe("jj_move_to", function()
+    local function ws()
+      return fixture({ [".jj/repo/store/git_target"] = "git" })
+    end
+
+    it("does nothing when the working copy is already on the commit", function()
+      local captured = {}
+      orig_system = stub_system({ { code = 0, stdout = "abc\n", stderr = "" } }, captured)
+      local result
+      vcs.jj_move_to("abc", function(err, moved) result = { err = err, moved = moved } end, ws())
+      vim.wait(200, function() return result ~= nil end)
+      assert.are.same({ moved = false }, result)
+      assert.are.equal(1, #captured)
+      assert.are.equal("--ignore-working-copy", captured[1].cmd[2])
+      assert.are.equal("present(abc) & (@ | parents(@ & empty()))", captured[1].cmd[5])
+    end)
+
+    it("runs jj new on the commit otherwise", function()
+      local captured = {}
+      orig_system = stub_system({
+        { code = 0, stdout = "", stderr = "" }, -- not there yet
+        { code = 0, stdout = "", stderr = "" }, -- jj new
+      }, captured)
+      local result
+      vcs.jj_move_to("abc", function(err, moved) result = { err = err, moved = moved } end, ws())
+      vim.wait(200, function() return result ~= nil end)
+      assert.are.same({ moved = true }, result)
+      assert.are.same({ "jj", "new", "abc" }, captured[2].cmd)
+    end)
+
+    it("surfaces jj new failures", function()
+      orig_system = stub_system({
+        { code = 0, stdout = "", stderr = "" },
+        { code = 1, stdout = "", stderr = "conflict\n" },
+      }, {})
+      local result
+      vcs.jj_move_to("abc", function(err, moved) result = { err = err, moved = moved } end, ws())
+      vim.wait(200, function() return result ~= nil end)
+      assert.are.same({ err = "conflict", moved = false }, result)
+    end)
+  end)
+
+  describe("jj_local_pr", function()
+    local spec = { head_ref = "feat", head_oid = "abc", base_ref = "main", base_oid = "def" }
+
+    it("snapshots, resolves the tip, then the merge base with the base", function()
+      local root = fixture({ [".jj/repo/store/git_target"] = "git" })
+      local captured = {}
+      orig_system = stub_system({
+        { code = 0, stdout = "1111\n", stderr = "" },
+        { code = 0, stdout = "2222\n", stderr = "" },
+      }, captured)
+      local result
+      vcs.jj_local_pr(spec, function(err, range) result = { err = err, range = range } end, root)
+      vim.wait(200, function() return result ~= nil end)
+      assert.are.same({ range = { head = "1111", base = "2222" } }, result)
+      -- The first query records the edits on disk: no --ignore-working-copy.
+      assert.are.equal("log", captured[1].cmd[2])
+      assert.are.equal("--ignore-working-copy", captured[2].cmd[2])
+      assert.are.equal(
+        'heads(::1111 & ::(bookmarks(exact:"main") | remote_bookmarks(exact:"main") | present(def)))',
+        captured[2].cmd[5]
+      )
+    end)
+
+    it("errors when the PR head is not in the repository", function()
+      local root = fixture({ [".jj/repo/store/git_target"] = "git" })
+      orig_system = stub_system({ { code = 0, stdout = "", stderr = "" } }, {})
+      local result
+      vcs.jj_local_pr(spec, function(err) result = err end, root)
+      vim.wait(200, function() return result ~= nil end)
+      assert.is_truthy(result:find("not in this jj repository"))
+    end)
+
+    it("errors without branches or oids, without spawning jj", function()
+      local spawned = false
+      orig_system = vim.system
+      vim.system = function() spawned = true end
+      local result
+      vcs.jj_local_pr({ head_ref = "feat" }, function(err) result = err end)
+      assert.is_false(spawned)
+      assert.is_truthy(result:find("unknown"))
     end)
   end)
 end)

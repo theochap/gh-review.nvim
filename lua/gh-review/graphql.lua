@@ -414,4 +414,252 @@ function M.fetch_pr_id(owner, repo, pr_number, callback)
   end)
 end
 
+--- Metadata of a native PR stack: cheap fields only. Merge status (checks,
+--- review, mergeability) costs ~60 ms per PR on GitHub's side, so it is
+--- fetched on its own by `fetch_pr_statuses`, after the pickers are open.
+local STACK_FIELDS = [[
+  number
+  size
+  baseRefName
+  entries(first: 100) {
+    nodes {
+      position
+      pullRequest {
+        number
+        title
+        url
+        state
+        isDraft
+        author { login }
+        headRefName
+        headRefOid
+        baseRefName
+        baseRefOid
+      }
+    }
+  }
+]]
+
+--- Search open PRs of a repo that sit in a native stack, with the stack
+--- metadata.
+---@param owner string
+---@param repo string
+---@param term string Extra search qualifiers, e.g. "author:@me"
+---@param callback fun(err: string?, nodes: { number: number, stack: table }[]?)
+function M.search_stacked_prs(owner, repo, term, callback)
+  local query = [[
+    query($q: String!) {
+      search(query: $q, type: ISSUE, first: 100) {
+        nodes {
+          ... on PullRequest {
+            number
+            stack {
+]] .. STACK_FIELDS .. [[
+            }
+          }
+        }
+      }
+    }
+  ]]
+  local q = vim.trim(string.format("repo:%s/%s is:pr is:open %s", owner, repo, term))
+  gh.graphql(query, { q = q }, function(err, data)
+    if err then
+      callback(err, nil)
+      return
+    end
+    local nodes = {}
+    for _, node in ipairs(data.search and data.search.nodes or {}) do
+      if type(node.stack) == "table" then table.insert(nodes, node) end
+    end
+    callback(nil, nodes)
+  end)
+end
+
+--- Most PRs whose merge status is fetched in one query. GitHub resolves the
+--- PRs of one query in turn (~60-200 ms each) and gives up after ~10 s (HTTP
+--- 502), but runs separate queries side by side: small batches in parallel
+--- are fastest (59 PRs: 4.9 s in batches of 25, 2 s in batches of 5).
+M.STATUS_BATCH = 5
+
+--- Split a list into batches of at most `limit` items.
+---@generic T
+---@param items T[]
+---@param limit number
+---@return T[][]
+function M._batches(items, limit)
+  local batches = {}
+  for i = 1, #items, limit do
+    table.insert(batches, vim.list_slice(items, i, i + limit - 1))
+  end
+  return batches
+end
+
+--- Fetch the merge status of PRs, in parallel batches of aliased fields.
+---@param owner string
+---@param repo string
+---@param numbers number[]
+---@param callback fun(err: string?, statuses: table<number, table>?) PullRequest nodes by number
+function M.fetch_pr_statuses(owner, repo, numbers, callback)
+  local batches = M._batches(numbers, M.STATUS_BATCH)
+  if #batches == 0 then
+    callback(nil, {})
+    return
+  end
+  local statuses, pending, failed = {}, #batches, false
+  for _, batch in ipairs(batches) do
+    local fields = {}
+    for _, n in ipairs(batch) do
+      table.insert(fields, string.format(
+        "p%d: pullRequest(number: %d) { number headRefOid baseRefOid mergeable mergeStateStatus reviewDecision statusCheckRollup { state } }",
+        n, n
+      ))
+    end
+    local query = string.format([[
+      query($owner: String!, $repo: String!) {
+        repository(owner: $owner, name: $repo) {
+          %s
+        }
+      }
+    ]], table.concat(fields, "\n"))
+    gh.graphql(query, { owner = owner, repo = repo }, function(err, data)
+      if failed then return end
+      if err then
+        failed = true
+        callback(err, nil)
+        return
+      end
+      for _, n in ipairs(batch) do
+        local pr = data.repository and data.repository["p" .. n]
+        if type(pr) == "table" then statuses[n] = pr end
+      end
+      pending = pending - 1
+      if pending == 0 then callback(nil, statuses) end
+    end)
+  end
+end
+
+---@class GHReviewCheck
+---@field name string Job or status context name
+---@field workflow? string Workflow name, for GitHub Actions jobs
+---@field state string Normalised: FAILURE, PENDING, SUCCESS, SKIPPED, NEUTRAL, CANCELLED, ...
+---@field url? string
+---@field required boolean
+
+--- Fetch the checks of a PR's head commit: GitHub Actions jobs and other check
+--- runs, plus commit status contexts.
+---@param owner string
+---@param repo string
+---@param pr_number number
+---@param callback fun(err: string?, result: { head_oid: string?, checks: GHReviewCheck[] }?)
+function M.fetch_pr_checks(owner, repo, pr_number, callback)
+  local query = [[
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          headRefOid
+          statusCheckRollup {
+            contexts(first: 100) {
+              nodes {
+                __typename
+                ... on CheckRun {
+                  name
+                  status
+                  conclusion
+                  detailsUrl
+                  isRequired(pullRequestNumber: $number)
+                  checkSuite { workflowRun { workflow { name } } }
+                }
+                ... on StatusContext {
+                  context
+                  state
+                  targetUrl
+                  isRequired(pullRequestNumber: $number)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]]
+  gh.graphql(query, { owner = owner, repo = repo, number = pr_number }, function(err, data)
+    if err then
+      callback(err, nil)
+      return
+    end
+    local pr = data.repository.pullRequest
+    local rollup = type(pr.statusCheckRollup) == "table" and pr.statusCheckRollup or nil
+    local nodes = rollup and rollup.contexts and rollup.contexts.nodes or {}
+    local function str(v) return type(v) == "string" and v or nil end
+    local checks = {}
+    for _, node in ipairs(nodes) do
+      if node.__typename == "CheckRun" then
+        local suite = type(node.checkSuite) == "table" and node.checkSuite or {}
+        local run = type(suite.workflowRun) == "table" and suite.workflowRun or {}
+        local workflow = type(run.workflow) == "table" and run.workflow or {}
+        -- A check run only has a conclusion once it is COMPLETED.
+        local state = node.status == "COMPLETED" and (str(node.conclusion) or "NEUTRAL") or "PENDING"
+        table.insert(checks, {
+          name = str(node.name) or "?",
+          workflow = str(workflow.name),
+          state = state,
+          url = str(node.detailsUrl),
+          required = node.isRequired == true,
+        })
+      elseif node.__typename == "StatusContext" then
+        local state = str(node.state) or "PENDING"
+        if state == "EXPECTED" then state = "PENDING" end
+        table.insert(checks, {
+          name = str(node.context) or "?",
+          state = state,
+          url = str(node.targetUrl),
+          required = node.isRequired == true,
+        })
+      end
+    end
+    callback(nil, { head_oid = str(pr.headRefOid), checks = checks })
+  end)
+end
+
+---@class GHReviewMergeSettings
+---@field methods string[] Allowed merge methods, e.g. { "squash", "merge" }
+---@field merge_queue boolean Whether merges go through a merge queue
+
+--- Fetch the stack metadata of a PR, plus the repo's merge settings.
+---@param owner string
+---@param repo string
+---@param pr_number number
+---@param callback fun(err: string?, stack: table?, settings: GHReviewMergeSettings?) `stack` is the raw PullRequestStack, nil when the PR is not stacked
+function M.fetch_pr_stack(owner, repo, pr_number, callback)
+  local query = [[
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        mergeCommitAllowed
+        squashMergeAllowed
+        rebaseMergeAllowed
+        pullRequest(number: $number) {
+          isMergeQueueEnabled
+          stack {
+]] .. STACK_FIELDS .. [[
+          }
+        }
+      }
+    }
+  ]]
+  gh.graphql(query, { owner = owner, repo = repo, number = pr_number }, function(err, data)
+    if err then
+      callback(err, nil, nil)
+      return
+    end
+    local r = data.repository
+    local methods = {}
+    if r.squashMergeAllowed then table.insert(methods, "squash") end
+    if r.mergeCommitAllowed then table.insert(methods, "merge") end
+    if r.rebaseMergeAllowed then table.insert(methods, "rebase") end
+    local pr = r.pullRequest
+    local stack = type(pr.stack) == "table" and pr.stack or nil
+    callback(nil, stack, { methods = methods, merge_queue = pr.isMergeQueueEnabled == true })
+  end)
+end
+
 return M

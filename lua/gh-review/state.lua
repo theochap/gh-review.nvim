@@ -65,6 +65,7 @@ local M = {}
 ---@field commit_files GHReviewFile[]
 ---@field view_mode? "split"|"inline" Current diff view mode; nil until a PR is loaded
 ---@field reviewed table<string, true> Set of file paths the user has manually marked as reviewed
+---@field local_diff boolean Files, diff and commits come from the local jj version of the PR
 
 ---@type GHReviewState
 local state = {
@@ -79,6 +80,7 @@ local state = {
   commit_files = {},
   view_mode = nil,
   reviewed = {},
+  local_diff = false,
 }
 
 function M.set_pr(pr)
@@ -193,12 +195,47 @@ function M.set_commits(commits)
   state.commits = commits
 end
 
+--- Where the files, diff and commits of the loaded PR came from.
+---@param source "cache"|"local"|"network"|"jj"|nil
+function M.set_content_source(source)
+  state.content_source = source
+end
+
+---@return "cache"|"local"|"network"|"jj"|nil
+function M.get_content_source()
+  return state.content_source
+end
+
+--- Whether the review shows the local jj version of the PR instead of the
+--- one on GitHub. Kept across reloads of the PR; `clear` turns it off.
+---@param on boolean
+function M.set_local_diff(on)
+  state.local_diff = on
+end
+
+---@return boolean
+function M.get_local_diff()
+  return state.local_diff
+end
+
 function M.get_commits()
   return state.commits
 end
 
-function M.set_active_commit(commit)
+--- Scope the review to `commit`. `on_disk` tells that the working copy sits on
+--- the commit (jj `@-`, git `HEAD`), so the files on disk are its version: the
+--- views then edit the real files instead of read-only snapshots.
+---@param commit GHReviewCommit
+---@param on_disk? boolean
+function M.set_active_commit(commit, on_disk)
   state.active_commit = commit
+  state.commit_on_disk = on_disk == true
+end
+
+--- Whether the files on disk are the active commit's (see `set_active_commit`).
+---@return boolean
+function M.is_commit_on_disk()
+  return state.active_commit ~= nil and state.commit_on_disk == true
 end
 
 function M.get_active_commit()
@@ -207,6 +244,7 @@ end
 
 function M.clear_active_commit()
   state.active_commit = nil
+  state.commit_on_disk = false
   state.commit_files = {}
 end
 
@@ -350,10 +388,13 @@ function M.clear()
   state.diff_text = ""
   state.active = false
   state.commits = {}
+  state.content_source = nil
   state.active_commit = nil
+  state.commit_on_disk = false
   state.commit_files = {}
   state.view_mode = nil
   state.reviewed = {}
+  state.local_diff = false
 end
 
 return M

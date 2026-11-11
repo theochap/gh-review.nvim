@@ -5,11 +5,25 @@ local M = {}
 
 local config = require("gh-review.config")
 
+---@class GHReviewCommentInputOpts
+---@field title string
+---@field on_submit fun(body: string)
+---@field on_cancel? fun()
+---@field context_lines? string[] Read-only lines shown above the input (reply context)
+---@field allow_empty? boolean
+---@field body_lines? string[] Initial content of the input
+---@field cursor_line? number Line of `body_lines` to put the cursor on (1-based, default 1)
+---@field suggestion_lines? string[] The commented lines; enables the key that inserts a suggestion block of them
+
 --- Open a scratch buffer for composing a comment
----@param opts { title: string, on_submit: fun(body: string), on_cancel?: fun(), context_lines?: string[], allow_empty?: boolean }
+---@param opts GHReviewCommentInputOpts
 function M.open(opts)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].buftype = "nofile"
+  -- Markdown for the highlighting, but no diagnostics: linters and the
+  -- markdown LSP attach on the filetype and would flag a comment draft
+  -- (line length, heading rules) that GitHub renders fine.
+  vim.diagnostic.enable(false, { bufnr = buf })
   vim.bo[buf].filetype = "markdown"
   vim.bo[buf].swapfile = false
 
@@ -18,15 +32,21 @@ function M.open(opts)
   -- Build initial content: a header hint line, optional reply context, then an
   -- empty input line. The header is a real buffer line (reliably rendered,
   -- unlike virtual lines above row 0) and is excluded from the submitted body.
-  local header = opts.title .. "  (C-s submit · Esc Esc cancel)"
+  local suggestion_key = opts.suggestion_lines and cfg.input_keys.suggestion or nil
+  local cancel_key = cfg.input_keys.cancel
+  local hints = { "C-s submit" }
+  if suggestion_key then table.insert(hints, suggestion_key .. " suggestion") end
+  if cancel_key and cancel_key ~= "" then table.insert(hints, cancel_key .. " cancel") end
+  local hint = table.concat(hints, " · ")
+  local header = opts.title .. "  (" .. hint .. ")"
   local init_lines = { header }
   if opts.context_lines and #opts.context_lines > 0 then
     vim.list_extend(init_lines, opts.context_lines)
     table.insert(init_lines, string.rep("─", 72))
   end
-  table.insert(init_lines, "") -- empty input line
+  local input_start = #init_lines -- 0-indexed line where the input begins
+  vim.list_extend(init_lines, opts.body_lines or { "" })
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, init_lines)
-  local input_start = #init_lines - 1 -- 0-indexed line of the empty input line
 
   -- Bottom split sized to fit header + context + a reasonable input area,
   -- capped by config.float.max_height so very large replies don't dominate.
@@ -53,7 +73,7 @@ function M.open(opts)
   for i = 1, input_start - 1 do
     vim.api.nvim_buf_add_highlight(buf, ns, "Comment", i, 0, -1)
   end
-  vim.api.nvim_win_set_cursor(win, { input_start + 1, 0 })
+  vim.api.nvim_win_set_cursor(win, { input_start + (opts.cursor_line or 1), 0 })
 
   vim.cmd("startinsert")
 
@@ -84,23 +104,26 @@ function M.open(opts)
     end, { buffer = buf, nowait = true })
   end
 
-  local esc_count = 0
-  vim.keymap.set({ "n", "i" }, "<Esc>", function()
-    esc_count = esc_count + 1
-    if esc_count >= 2 then
+  -- Insert a suggestion block of the commented lines below the cursor, and
+  -- move the cursor onto its first line of code.
+  if suggestion_key then
+    vim.keymap.set({ "n", "i" }, suggestion_key, function()
+      local row = math.max(vim.api.nvim_win_get_cursor(win)[1], input_start + 1)
+      local block = require("gh-review.util").suggestion_block(opts.suggestion_lines)
+      vim.api.nvim_buf_set_lines(buf, row, row, false, block)
+      vim.api.nvim_win_set_cursor(win, { row + 2, 0 })
+    end, { buffer = buf, nowait = true, desc = "Insert a suggestion block" })
+  end
+
+  -- Cancel from normal mode; <Esc> keeps its usual meaning.
+  if cancel_key and cancel_key ~= "" then
+    vim.keymap.set("n", cancel_key, function()
       close()
       if opts.on_cancel then
         opts.on_cancel()
       end
-    else
-      if vim.fn.mode() == "i" then
-        vim.cmd("stopinsert")
-      end
-      vim.defer_fn(function()
-        esc_count = 0
-      end, 500)
-    end
-  end, { buffer = buf, nowait = true })
+    end, { buffer = buf, nowait = true, desc = "Cancel the comment" })
+  end
 
   return win, buf
 end

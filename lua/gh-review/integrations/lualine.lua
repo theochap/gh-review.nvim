@@ -25,6 +25,7 @@ function M.component()
   end
 
   local base = string.format("%s #%d %s %s", icons.branch, pr.number, pr.head_ref or "", status_icon)
+  if state.get_local_diff() then base = base .. " [jj]" end
   local active_commit = state.get_active_commit()
   if active_commit then
     local msg = active_commit.message or ""
